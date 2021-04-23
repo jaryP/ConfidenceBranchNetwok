@@ -150,9 +150,9 @@ def branches_entropy(model: BranchModel,
 
         scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
 
-        scores['branches_counter'] = exits_counter
+        # scores['branches_counter'] = exits_counter
 
-    return scores
+    return scores, exits_counter
 
 
 

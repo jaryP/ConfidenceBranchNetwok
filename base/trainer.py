@@ -13,13 +13,13 @@ from bayesian.posteriors import BayesianPosterior
 from models.base import BranchModel
 
 
-def trainer(model: BranchModel,
-            optimizer,
-            train_loader,
-            epochs,
-            scheduler=None,
-            early_stopping=None,
-            test_loader=None, eval_loader=None, device='cpu'):
+def standard_trainer(model: BranchModel,
+                     optimizer,
+                     train_loader,
+                     epochs,
+                     scheduler=None,
+                     early_stopping=None,
+                     test_loader=None, eval_loader=None, device='cpu'):
     scores = []
     mean_losses = []
 
@@ -53,8 +53,8 @@ def trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
+            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)
         else:
             eval_scores = 0
 
@@ -77,10 +77,14 @@ def trainer(model: BranchModel,
         train_scores = standard_eval(model, train_loader, device=device)
         test_scores = standard_eval(model, test_loader, device=device)
 
+        # score_dict = {'Train score': train_scores, 'Test score': test_scores,
+        #               'Eval score': eval_scores if eval_scores != 0 else 0}
+
         bar.set_postfix(
             {'Train score': train_scores, 'Test score': test_scores,
              'Eval score': eval_scores if eval_scores != 0 else 0,
              'Mean loss': mean_loss})
+
         scores.append((train_scores, eval_scores, test_scores))
 
     return best_model, \
@@ -144,7 +148,7 @@ def joint_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
+            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
                                            device=device)
         else:
             eval_scores = 0
@@ -194,6 +198,7 @@ def output_combiner_trainer(model: BranchModel,
     mean_losses = []
 
     best_model = model.state_dict()
+    best_predictors = predictors.state_dict()
     best_model_i = 0
 
     model.to(device)
@@ -264,9 +269,11 @@ def output_combiner_trainer(model: BranchModel,
                 break
             elif r > 0:
                 best_model = model.state_dict()
+                best_predictors = predictors.state_dict()
                 best_model_i = epoch
         else:
             best_model = model.state_dict()
+            best_predictors = predictors.state_dict()
             best_model_i = epoch
 
         train_scores = standard_eval(model, train_loader, device=device)
@@ -278,7 +285,7 @@ def output_combiner_trainer(model: BranchModel,
              'Mean loss': mean_loss})
         scores.append((train_scores, eval_scores, test_scores))
 
-    return best_model, scores, scores[best_model_i] if len(
+    return (best_model, best_predictors), scores, scores[best_model_i] if len(
         scores) > 0 else 0, mean_losses
 
 
@@ -391,7 +398,6 @@ def posterior_classifier_trainer(model: BranchModel,
                                  test_loader=None, eval_loader=None,
                                  cumulative_prior=False,
                                  device='cpu'):
-
     if not isinstance(prior, list):
         if not cumulative_prior:
             prior = [prior] * len(predictors)
@@ -477,7 +483,6 @@ def posterior_classifier_trainer(model: BranchModel,
             losses.append(loss.item())
 
             loss += kl
-
 
             optimizer.zero_grad()
             loss.backward()

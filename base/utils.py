@@ -8,6 +8,8 @@ from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from torchvision import datasets
 from torchvision.transforms import transforms
 
+from models.alexnet import AlexNet
+
 
 def gaussian_kernel(a, b, gamma=None):
     a = a.squeeze()
@@ -69,53 +71,53 @@ def ensures_path(path):
     return True
 
 
-# def get_model(name, input_size=None, output=None):
-#     name = name.lower()
-#     if name == 'lenet-300-100':
-#         model = LeNet_300_100(input_size, output)
-#     elif name == 'lenet-5':
-#         model = LeNet(input_size, output)
-#     elif 'vgg' in name:
-#         # if 'bn' in name:
-#         if name == 'vgg11':
-#             model = vgg11(pretrained=False, num_classes=output)
-#         elif name == 'vgg16':
-#             model = vgg16(pretrained=False, num_classes=output)
-#         else:
-#             assert False
-#
-#         for n, m in model.named_modules():
-#             if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
-#                 if m.bias is not None:
-#                     if m.bias.sum() == 0:
-#                         m.bias = None
-#
-#     elif 'alexnet' in name:
-#         model = AlexNet(num_classes=output)
-#
-#         for n, m in model.named_modules():
-#             if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
-#                 if m.bias is not None:
-#                     if m.bias.sum() == 0:
-#                         m.bias = None
-#     elif 'resnet' in name:
-#         if name == 'resnet20':
-#             model = resnet20(num_classes=output)
-#         elif name == 'resnet32':
-#             model = resnet32(num_classes=output)
-#         else:
-#             assert False
-#
-#         for n, m in model.named_modules():
-#             if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
-#                 if m.bias is not None:
-#                     if m.bias.sum() == 0:
-#                         m.bias = None
-#
-#     else:
-#         assert False
-#
-#     return model
+def get_model(name, input_size=None, output=None):
+    name = name.lower()
+    # if name == 'lenet-300-100':
+    #     model = LeNet_300_100(input_size, output)
+    # elif name == 'lenet-5':
+    #     model = LeNet(input_size, output)
+    # elif 'vgg' in name:
+    #     # if 'bn' in name:
+    #     if name == 'vgg11':
+    #         model = vgg11(pretrained=False, num_classes=output)
+    #     elif name == 'vgg16':
+    #         model = vgg16(pretrained=False, num_classes=output)
+    #     else:
+    #         assert False
+    #
+    #     for n, m in model.named_modules():
+    #         if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
+    #             if m.bias is not None:
+    #                 if m.bias.sum() == 0:
+    #                     m.bias = None
+
+    if 'alexnet' in name:
+        model = AlexNet(num_classes=output)
+
+        # for n, m in model.named_modules():
+        #     if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
+        #         if m.bias is not None:
+        #             if m.bias.sum() == 0:
+        #                 m.bias = None
+    # elif 'resnet' in name:
+    #     if name == 'resnet20':
+    #         model = resnet20(num_classes=output)
+    #     elif name == 'resnet32':
+    #         model = resnet32(num_classes=output)
+    #     else:
+    #         assert False
+    #
+    #     for n, m in model.named_modules():
+    #         if hasattr(m, 'bias') and not isinstance(m, _BatchNorm):
+    #             if m.bias is not None:
+    #                 if m.bias.sum() == 0:
+    #                     m.bias = None
+
+    else:
+        assert False
+
+    return model
 
 
 def get_dataset(name, model_name):
