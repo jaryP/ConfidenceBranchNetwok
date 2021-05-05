@@ -8,12 +8,14 @@ from torch.distributions import Beta
 from torch.optim import Adam
 from torch.distributions.continuous_bernoulli import ContinuousBernoulli
 
-from base.evaluators import branches_eval, branches_entropy
+from base.evaluators import branches_eval, branches_entropy, branches_binary, \
+    branches_mean
 from bayesian.posteriors import MatrixEmbedding, LayerEmbeddingBeta, \
-    LayerEmbeddingContBernoulli
+    LayerEmbeddingContBernoulli, BayesianHead, BayesianHeads
 from models.alexnet import AlexNet
-from base.trainer import trainer, joint_trainer, output_combiner_trainer, \
-    binary_classifier_trainer, posterior_classifier_trainer
+from base.trainer import joint_trainer, output_combiner_trainer, \
+    binary_classifier_trainer, posterior_classifier_trainer, \
+    binary_posterior_joint_trainer, bayesian_joint_trainer
 from base.utils import get_dataset
 
 # from prototipo import branch_lenet
@@ -293,40 +295,95 @@ posteriors = LayerEmbeddingContBernoulli(alpha_layers=betas)
 # print(branches_eval(model, predictors, test_loader, device=DEVICE))
 # exit()
 # print(dict(posteriors.named_parameters()).keys())
+
+prior = [Beta(0.1, 2), Beta(0.1, 1), Beta(1, 2), Beta(0.5, 0.5), Beta(2, 1)]
+# prior = Beta(0.5, 0.5)
+# prior = ContinuousBernoulli(torch.tensor([0.5], device=DEVICE))
+for i in np.linspace(0, 1, 50, endpoint=False):
+    a = ContinuousBernoulli(torch.tensor([i]))
+    print(i, a.entropy().item(), a.mean)
+
+prior = [ContinuousBernoulli(0.1),
+         ContinuousBernoulli(0.2),
+         ContinuousBernoulli(0.5),
+         ContinuousBernoulli(0.8),
+         ContinuousBernoulli(0.9)]
+# posterior_regularization_trainer
+
 opt = Adam(chain(model.parameters(),
                  predictors.parameters(),
                  posteriors.parameters()),
            lr=0.001)
-
-prior = [Beta(0.1, 2), Beta(0.1, 1), Beta(1, 2), Beta(0.5, 0.5), Beta(2, 1)]
-# prior = Beta(0.5, 0.5)
-prior = ContinuousBernoulli(torch.tensor([0.2]))
-# prior = [ContinuousBernoulli(torch.tensor([0.1])),
-#          ContinuousBernoulli(torch.tensor([0.25])),
-#          ContinuousBernoulli(torch.tensor([0.5])),
-#          ContinuousBernoulli(torch.tensor([0.6])),
-#          ContinuousBernoulli(torch.tensor([0.7]))]
 
 best_base_model, _, best_scores, _ = posterior_classifier_trainer(model=model,
                                                                   predictors=predictors,
                                                                   posteriors=posteriors,
                                                                   optimizer=opt,
                                                                   prior=prior,
-                                                                  prior_w=0.1,
+                                                                  prior_w=0.001,
+                                                                  energy_w=1e-10,
                                                                   train_loader=train_loader,
-                                                                  epochs=JOINT_EPOCHS,
-                                                                  use_mmd=True,
+                                                                  epochs=5,
+                                                                  use_mmd=False,
                                                                   scheduler=None,
                                                                   early_stopping=None,
                                                                   test_loader=test_loader,
                                                                   eval_loader=None,
                                                                   device=DEVICE,
                                                                   cumulative_prior=False)
+
+s, c = branches_binary(model=model,
+                       binary_classifiers=posteriors,
+                       dataset_loader=test_loader,
+                       predictors=predictors,
+                       threshold=0.5,
+                       device=DEVICE)
+
+print(s, c)
+
+# # for h in [0.1, 0.25, 0.5, 0.75]:
+#     s = branches_entropy(model=model,
+#                          threshold=h,
+#                          dataset_loader=test_loader,
+#                          predictors=predictors,
+#                          device=DEVICE)
+#     print(h, s)
+
+
+# heads = []
+#
+# for o in outputs:
+#     h = BayesianHead(o, classes, DEVICE)
+#     heads.append(h)
+#
+# predictors = BayesianHeads(heads)
+#
+# opt = Adam(chain(model.parameters(),
+#                  predictors.parameters()),
+#            lr=0.001)
+
+# best_base_model, _, best_scores, _ = bayesian_joint_trainer(model=model,
+#                                                             predictors=predictors,
+#                                                             optimizer=opt,
+#                                                             train_loader=train_loader,
+#                                                             epochs=10,
+#                                                             samples=1,
+#                                                             scheduler=None,
+#                                                             early_stopping=None,
+#                                                             test_loader=test_loader,
+#                                                             eval_loader=None,
+#                                                             device=DEVICE)
+
+print(branches_eval(model, predictors, test_loader, device=DEVICE))
+
 for h in [0.1, 0.25, 0.5, 0.75]:
     s = branches_entropy(model=model,
                          threshold=h,
                          dataset_loader=test_loader,
                          predictors=predictors,
-                         device=DEVICE)
+                         device=DEVICE, samples=2)
     print(h, s)
-print(branches_eval(model, predictors, test_loader, device=DEVICE))
+
+# a = branches_mean(model, predictors, posteriors, test_loader, device=DEVICE,
+#                   topk=[1, 5], c=2.5, samples=5)
+# print(a)

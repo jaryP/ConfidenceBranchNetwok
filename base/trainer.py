@@ -7,10 +7,11 @@ from torch.distributions import Distribution, kl_divergence
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tqdm import tqdm
 
-from base.evaluators import standard_eval
+from base.evaluators import standard_eval, branches_binary
 from base.utils import mmd
-from bayesian.posteriors import BayesianPosterior
-from models.base import BranchModel
+from bayesian.bayesian_utils import compute_mmd
+from bayesian.posteriors import BayesianPosterior, BayesianHead, BayesianHeads
+from models.base import BranchModel, branches_predictions
 
 
 def standard_trainer(model: BranchModel,
@@ -149,7 +150,7 @@ def joint_trainer(model: BranchModel,
 
         if eval_loader is not None:
             eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
+                                        device=device)
         else:
             eval_scores = 0
 
@@ -295,6 +296,7 @@ def binary_classifier_trainer(model: BranchModel,
                               optimizer,
                               train_loader,
                               epochs,
+                              energy_w=1,
                               scheduler=None,
                               early_stopping=None,
                               test_loader=None, eval_loader=None, device='cpu'):
@@ -302,6 +304,9 @@ def binary_classifier_trainer(model: BranchModel,
     mean_losses = []
 
     best_model = model.state_dict()
+    best_predictors = predictors.state_dict()
+    best_binaries = binary_classifiers.state_dict()
+
     best_model_i = 0
 
     model.to(device)
@@ -309,6 +314,9 @@ def binary_classifier_trainer(model: BranchModel,
 
     if early_stopping is not None:
         early_stopping.reset()
+
+    sample_image = next(iter(train_loader))[0][1:2].to(device)
+    costs = branches_predictions(model, predictors, sample_image)
 
     model.train()
     bar = tqdm(range(epochs), leave=True)
@@ -333,16 +341,206 @@ def binary_classifier_trainer(model: BranchModel,
             preds = torch.stack(preds, 0)
 
             f_hat = final_pred
-            for i in reversed(range(0, len(preds) - 1)):
+            gamma_hat = costs['final']
+
+            for i in reversed(range(0, len(preds))):
                 f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
+                gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
+
+            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
+            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
+            # gamma_hat = costs['final']
+            # for i in reversed(range(0, len(preds))):
+            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
+            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
+            # print(gamma_hat.mean())
+            gamma_hat = gamma_hat.mean() * energy_w
 
             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+            loss += gamma_hat
 
             losses.append(loss.item())
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+        s, c = branches_binary(model=model,
+                               binary_classifiers=binary_classifiers,
+                               dataset_loader=test_loader,
+                               predictors=predictors,
+                               threshold=0.5,
+                               device=device)
+
+        print(s, c)
+
+        if scheduler is not None:
+            if isinstance(scheduler, (StepLR, MultiStepLR)):
+                scheduler.step()
+            elif hasattr(scheduler, 'step'):
+                scheduler.step()
+
+        if eval_loader is not None:
+            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)
+        else:
+            eval_scores = 0
+
+        mean_loss = sum(losses) / len(losses)
+        mean_losses.append(mean_loss)
+
+        if early_stopping is not None:
+            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+                else early_stopping.step(mean_loss)
+
+            if r < 0:
+                break
+            elif r > 0:
+                best_model = model.state_dict()
+                best_predictors = predictors.state_dict()
+                best_binaries = binary_classifiers.state_dict()
+
+                best_model_i = epoch
+        else:
+            best_model = model.state_dict()
+            best_predictors = predictors.state_dict()
+            best_binaries = binary_classifiers.state_dict()
+
+            best_model_i = epoch
+
+        train_scores = standard_eval(model, train_loader, device=device)
+        test_scores = standard_eval(model, test_loader, device=device)
+
+        bar.set_postfix(
+            {'Train score': train_scores, 'Test score': test_scores,
+             'Eval score': eval_scores if eval_scores != 0 else 0,
+             'Mean loss': mean_loss})
+        scores.append((train_scores, eval_scores, test_scores))
+
+    return (best_model, best_predictors, best_binaries), \
+           scores, scores[best_model_i], mean_losses
+
+
+def posterior_classifier_trainer(model: BranchModel,
+                                 predictors: nn.ModuleList,
+                                 posteriors: BayesianPosterior,
+                                 optimizer,
+                                 train_loader,
+                                 epochs,
+                                 prior: Union[Distribution, List[Distribution]],
+                                 prior_w=1,
+                                 energy_w=1e-8,
+                                 use_mmd=True,
+                                 scheduler=None,
+                                 early_stopping=None,
+                                 test_loader=None, eval_loader=None,
+                                 cumulative_prior=False,
+                                 device='cpu'):
+
+    if not isinstance(prior, list):
+        if not cumulative_prior:
+            prior = [prior] * len(predictors)
+    else:
+        cumulative_prior = False
+
+    im_shape = tuple(next(iter(train_loader))[0][1].shape)
+    costs = branches_predictions(model, predictors, im_shape)
+
+    scores = []
+    mean_losses = []
+
+    best_model = model.state_dict()
+    best_model_i = 0
+
+    model.to(device)
+    predictors.to(device)
+
+    if early_stopping is not None:
+        early_stopping.reset()
+
+    model.train()
+    bar = tqdm(range(epochs), leave=True)
+    for epoch in bar:
+        model.train()
+        losses = []
+        for i, (x, y) in enumerate(train_loader):
+            model.train()
+            posteriors.train()
+            predictors.train()
+
+            x, y = x.to(device), y.to(device)
+            final_pred, bos = model(x)
+
+            hs = torch.stack([posteriors(branch_index=j, logits=bo)
+                              for j, bo
+                              in enumerate(bos)], 0)
+
+            ps = [posteriors.get_posterior(branch_index=j,
+                                           logits=bo)
+                  for j, bo
+                  in enumerate(bos)]
+
+            preds = [p(bo) for p, bo in zip(predictors, bos)]
+            preds = torch.stack(preds + [final_pred], 0)
+
+            f_hat = preds[-1]
+            for pi in reversed(range(0, len(preds) - 1)):
+                f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
+
+            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+            losses.append(loss.item())
+
+            gamma_hat = costs['final']
+            for i in reversed(range(0, len(preds) - 1)):
+                gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
+
+            gamma_hat = gamma_hat.mean() * energy_w
+            loss += gamma_hat
+
+            kl = 0
+
+            if cumulative_prior:
+                s = torch.cat([p.rsample() for i, p in enumerate(ps)], 0)
+                sp = prior.sample(s.size()).to(device)
+                kl = mmd(s, sp)
+            else:
+                for pi, p in enumerate(ps):
+                    if use_mmd:
+                        s = p.rsample()
+                        kl += mmd(s, prior[pi].sample(s.size()).to(s.device))
+                    else:
+                        kl += kl_divergence(p, prior[pi]).mean()
+
+            klw = 2 ** (len(train_loader) - i - 1) \
+                  / (2 ** len(train_loader) - 1)
+            kl *= prior_w # * klw
+
+            loss += kl
+
+            # pairwise_kl = 0
+            # for p in range(len(ps) - 1):
+            #     # pairwise_kl += kl_divergence(ps[p], ps[p+1])
+            #     # pairwise_kl += compute_mmd(ps[p].rsample([1, 100]),
+            #     #                    ps[p+1].sample([1, 100]))
+            #     pairwise_kl += torch.pow(ps[p].rsample([100]) -
+            #                              ps[p + 1].sample([100]), 2).sum([1, 2])
+            #
+            # pairwise_kl = pairwise_kl.mean()
+            #
+            # # print(pairwise_kl, end='... ')
+            # pairwise_kl = 1 / pairwise_kl.mean()
+            # # pairwise_kl *= 1e-6
+            # # print(pairwise_kl)
+            #
+            # loss += pairwise_kl
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # for optimizer.
+            # for n, p in posteriors.named_parameters():
+            #     print(n, p.grad)
 
         if scheduler is not None:
             if isinstance(scheduler, (StepLR, MultiStepLR)):
@@ -384,20 +582,150 @@ def binary_classifier_trainer(model: BranchModel,
     return best_model, scores, scores[best_model_i], mean_losses
 
 
-def posterior_classifier_trainer(model: BranchModel,
-                                 predictors: nn.ModuleList,
-                                 posteriors: BayesianPosterior,
-                                 optimizer,
-                                 train_loader,
-                                 epochs,
-                                 prior: Union[Distribution, List[Distribution]],
-                                 prior_w=1,
-                                 use_mmd=True,
-                                 scheduler=None,
-                                 early_stopping=None,
-                                 test_loader=None, eval_loader=None,
-                                 cumulative_prior=False,
-                                 device='cpu'):
+# def posterior_regularization_trainer(model: BranchModel,
+#                                      predictors: nn.ModuleList,
+#                                      posteriors: BayesianPosterior,
+#                                      optimizer,
+#                                      train_loader,
+#                                      epochs,
+#                                      prior: Union[
+#                                          Distribution, List[Distribution]],
+#                                      kl_divergence_w=1,
+#                                      scheduler=None,
+#                                      early_stopping=None,
+#                                      test_loader=None, eval_loader=None,
+#                                      device='cpu'):
+#     if not isinstance(prior, list):
+#         prior = [prior] * len(predictors)
+#
+#     scores = []
+#     mean_losses = []
+#
+#     best_model = model.state_dict()
+#     best_model_i = 0
+#
+#     model.to(device)
+#     predictors.to(device)
+#
+#     if early_stopping is not None:
+#         early_stopping.reset()
+#
+#     model.train()
+#     bar = tqdm(range(epochs), leave=True)
+#     for epoch in bar:
+#         model.train()
+#         losses = []
+#         for i, (x, y) in enumerate(train_loader):
+#             model.train()
+#             posteriors.train()
+#             predictors.train()
+#
+#             x, y = x.to(device), y.to(device)
+#             final_pred, bos = model(x)
+#
+#             hs = torch.stack([posteriors(branch_index=i, logits=bo)
+#                               for i, bo
+#                               in enumerate(bos)], 0)
+#
+#             # hs = hs.to(device)
+#             # if hs.min() < 0 or hs.max() > 1:
+#             #     hs = torch.sigmoid(hs)
+#
+#             preds = [p(bo) for p, bo in zip(predictors, bos)]
+#             preds = torch.stack(preds + [final_pred], 0)
+#
+#             f_hat = preds[-1]
+#             for i in reversed(range(0, len(preds) - 1)):
+#                 f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
+#
+#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+#
+#             ps = [posteriors.get_posterior(branch_index=i,
+#                                            logits=bo)
+#                   for i, bo
+#                   in enumerate(bos)]
+#
+#             kl = 0
+#             for i, p in enumerate(ps):
+#                 print('BETA', i,
+#                       p.concentration1.shape,
+#                       p.concentration1[0],
+#                       p.concentration0[0],
+#                       hs[i][0],
+#                       kl_divergence(p, prior[i]).mean())
+#
+#                 kl += kl_divergence(p, prior[i]).mean()
+#             kl *= kl_divergence_w
+#
+#             print(kl)
+#
+#             loss += kl
+#
+#             losses.append(loss.item())
+#
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
+#
+#             # for optimizer.
+#             # for n, p in posteriors.named_parameters():
+#             #     print(n, p.grad)
+#
+#         if scheduler is not None:
+#             if isinstance(scheduler, (StepLR, MultiStepLR)):
+#                 scheduler.step()
+#             elif hasattr(scheduler, 'step'):
+#                 scheduler.step()
+#
+#         if eval_loader is not None:
+#             eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
+#                                            device=device)
+#         else:
+#             eval_scores = 0
+#
+#         mean_loss = sum(losses) / len(losses)
+#         mean_losses.append(mean_loss)
+#
+#         if early_stopping is not None:
+#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+#                 else early_stopping.step(mean_loss)
+#
+#             if r < 0:
+#                 break
+#             elif r > 0:
+#                 best_model = model.state_dict()
+#                 best_model_i = epoch
+#         else:
+#             best_model = model.state_dict()
+#             best_model_i = epoch
+#
+#         train_scores = standard_eval(model, train_loader, device=device)
+#         test_scores = standard_eval(model, test_loader, device=device)
+#
+#         bar.set_postfix(
+#             {'Train score': train_scores, 'Test score': test_scores,
+#              'Eval score': eval_scores if eval_scores != 0 else 0,
+#              'Mean loss': mean_loss})
+#         scores.append((train_scores, eval_scores, test_scores))
+#
+#     return best_model, scores, scores[best_model_i], mean_losses
+
+
+def binary_posterior_joint_trainer(model: BranchModel,
+                                   predictors: nn.ModuleList,
+                                   posteriors: BayesianPosterior,
+                                   optimizer,
+                                   train_loader,
+                                   epochs,
+                                   prior: Union[
+                                       Distribution, List[Distribution]],
+                                   prior_w=1,
+                                   use_mmd=True,
+                                   scheduler=None,
+                                   early_stopping=None,
+                                   test_loader=None, eval_loader=None,
+                                   cumulative_prior=False,
+                                   device='cpu'):
     if not isinstance(prior, list):
         if not cumulative_prior:
             prior = [prior] * len(predictors)
@@ -432,6 +760,7 @@ def posterior_classifier_trainer(model: BranchModel,
             hs = torch.stack([posteriors(branch_index=j, logits=bo)
                               for j, bo
                               in enumerate(bos)], 0)
+
             ps = [posteriors.get_posterior(branch_index=j,
                                            logits=bo)
                   for j, bo
@@ -441,14 +770,17 @@ def posterior_classifier_trainer(model: BranchModel,
             # if hs.min() < 0 or hs.max() > 1:
             #     hs = torch.sigmoid(hs)
 
-            preds = [p(bo) for p, bo in zip(predictors, bos)]
-            preds = torch.stack(preds + [final_pred], 0)
+            preds = torch.stack([p(bo) * h for p, bo, h in
+                                 zip(predictors, bos, hs)])
 
-            f_hat = preds[-1]
-            for pi in reversed(range(0, len(preds) - 1)):
-                f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
+            preds = preds.sum(0) + final_pred
+            # preds = torch.stack(preds + [final_pred], 0)
+            #
+            # f_hat = preds[-1]
+            # for pi in reversed(range(0, len(preds) - 1)):
+            #     f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
 
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+            loss = nn.functional.cross_entropy(preds, y, reduction='mean')
 
             kl = 0
 
@@ -474,11 +806,20 @@ def posterior_classifier_trainer(model: BranchModel,
                     else:
                         kl += kl_divergence(p, prior[pi]).mean()
 
+            a = 0
+            for pi in range(len(ps) - 1):
+                # a += kl_divergence(ps[pi], ps[pi + 1]).sum()
+                a += torch.pow(hs[pi] - hs[pi + 1], 2).mean()
+            # print(a, 1 / a)
+            a = 1 / a
+
             # kl = kl / len(ps)
             klw = 2 ** (len(train_loader) - i - 1) \
                   / (2 ** len(train_loader) - 1)
-            kl *= prior_w * klw
 
+            kl *= prior_w * klw + a
+
+            # print(a)
             # print(kl, loss, klw)
             losses.append(loss.item())
 
@@ -499,8 +840,8 @@ def posterior_classifier_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
+            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)
         else:
             eval_scores = 0
 
@@ -532,26 +873,196 @@ def posterior_classifier_trainer(model: BranchModel,
     return best_model, scores, scores[best_model_i], mean_losses
 
 
-def posterior_regularization_trainer(model: BranchModel,
-                                     predictors: nn.ModuleList,
-                                     posteriors: BayesianPosterior,
-                                     optimizer,
-                                     train_loader,
-                                     epochs,
-                                     prior: Union[
-                                         Distribution, List[Distribution]],
-                                     kl_divergence_w=1,
-                                     scheduler=None,
-                                     early_stopping=None,
-                                     test_loader=None, eval_loader=None,
-                                     device='cpu'):
-    if not isinstance(prior, list):
-        prior = [prior] * len(predictors)
+# def posterior_classifier_trainer(model: BranchModel,
+#                                  predictors: nn.ModuleList,
+#                                  posteriors: BayesianPosterior,
+#                                  optimizer,
+#                                  train_loader,
+#                                  epochs,
+#                                  prior: Union[Distribution, List[Distribution]],
+#                                  prior_w=1,
+#                                  entropy_w=1,
+#                                  use_mmd=True,
+#                                  scheduler=None,
+#                                  early_stopping=None,
+#                                  test_loader=None, eval_loader=None,
+#                                  cumulative_prior=False,
+#                                  device='cpu'):
+#     if not isinstance(prior, list):
+#         if not cumulative_prior:
+#             prior = [prior] * len(predictors)
+#     else:
+#         cumulative_prior = False
+#
+#     scores = []
+#     mean_losses = []
+#
+#     best_model = model.state_dict()
+#     best_predictors = predictors.state_dict()
+#     best_posteriors = posteriors.state_dict()
+#     best_model_i = 0
+#
+#     model.to(device)
+#     predictors.to(device)
+#
+#     if early_stopping is not None:
+#         early_stopping.reset()
+#
+#     model.train()
+#     bar = tqdm(range(epochs), leave=True)
+#     for epoch in bar:
+#         model.train()
+#         losses = []
+#
+#         for i, (x, y) in enumerate(train_loader):
+#             model.train()
+#             posteriors.train()
+#             predictors.train()
+#
+#             x, y = x.to(device), y.to(device)
+#             final_pred, bos = model(x)
+#
+#             hs = torch.stack([posteriors(branch_index=j, logits=bo)
+#                               for j, bo
+#                               in enumerate(bos)], 0)
+#             # hs = hs.to(device)
+#             # if hs.min() < 0 or hs.max() > 1:
+#             #     hs = torch.sigmoid(hs)
+#
+#             preds = [p(bo) for p, bo in zip(predictors, bos)]
+#             preds = torch.stack(preds + [final_pred], 0)
+#
+#             f_hat = preds[-1]
+#             for pi in reversed(range(0, len(preds) - 1)):
+#                 f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
+#
+#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+#
+#             ps = [posteriors.get_posterior(branch_index=j,
+#                                            logits=bo)
+#                   for j, bo
+#                   in enumerate(bos)]
+#
+#             kl = 0
+#
+#             if cumulative_prior:
+#                 s = torch.cat([p.rsample() for i, p in enumerate(ps)], 0)
+#                 sp = prior.sample(s.size()).to(device)
+#                 kl = mmd(s, sp)
+#             else:
+#                 for pi, p in enumerate(ps):
+#                     # a, b = p.concentration1.mean(0), p.concentration0.mean(0)
+#                     # m = a / (a + b)
+#                     # std = (a * b) / ((a + b)**2 * (a + b + 1))
+#                     # print('BETA', i,
+#                     #       p.concentration1.mean(0).item(),
+#                     #       p.concentration0.mean(0).item(),
+#                     #       hs[i].mean(0).item(), hs[i].std(0).item(),
+#                     #       kl_divergence(p, prior[i]).mean().item(),
+#                     #       m, std)
+#                     # print(mmd(s, prior[i].sample(s.size()).to(s.device)))
+#                     if use_mmd:
+#                         s = p.rsample()
+#                         # kl += mmd(s, prior[pi].sample(s.size()).to(s.device))
+#                         kl += compute_mmd(s, prior[pi].sample(s.size()).to(
+#                             s.device))
+#                     else:
+#                         kl += kl_divergence(p, prior[pi]).mean()
+#
+#             klw = 2 ** (len(train_loader) - i - 1) \
+#                   / (2 ** len(train_loader) - 1)
+#
+#             kl *= prior_w
+#
+#             h = torch.stack([p.entropy().mean(0) for p in ps])
+#
+#             if i == 0:
+#                 print(h)
+#
+#             h = torch.sum(h) * entropy_w
+#
+#             reg = (h + kl) * klw
+#             loss += reg
+#
+#             losses.append(loss.item())
+#
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
+#
+#             # for optimizer.
+#             # for n, p in posteriors.named_parameters():
+#             #     print(n, p.grad)
+#
+#         ps = [posteriors.get_posterior(branch_index=j,
+#                                        logits=bo)
+#               for j, bo
+#               in enumerate(bos)]
+#         h = [p.entropy().mean(0).item() for p in ps]
+#         print(epoch, h)
+#
+#         if scheduler is not None:
+#             if isinstance(scheduler, (StepLR, MultiStepLR)):
+#                 scheduler.step()
+#             elif hasattr(scheduler, 'step'):
+#                 scheduler.step()
+#
+#         if eval_loader is not None:
+#             eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+#                                         device=device)
+#         else:
+#             eval_scores = 0
+#
+#         mean_loss = sum(losses) / len(losses)
+#         mean_losses.append(mean_loss)
+#
+#         if early_stopping is not None:
+#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+#                 else early_stopping.step(mean_loss)
+#             if r < 0:
+#                 break
+#             elif r > 0:
+#                 best_model = model.state_dict()
+#                 best_predictors = predictors.state_dict()
+#                 best_posteriors = posteriors.state_dict()
+#                 best_model_i = epoch
+#         else:
+#             best_model = model.state_dict()
+#             best_predictors = predictors.state_dict()
+#             best_posteriors = posteriors.state_dict()
+#             best_model_i = epoch
+#
+#         train_scores = standard_eval(model, train_loader, device=device)
+#         test_scores = standard_eval(model, test_loader, device=device)
+#
+#         bar.set_postfix(
+#             {'Train score': train_scores, 'Test score': test_scores,
+#              'Eval score': eval_scores if eval_scores != 0 else 0,
+#              'Mean loss': mean_loss})
+#         scores.append((train_scores, eval_scores, test_scores))
+#
+#     return (best_model, best_predictors, best_posteriors), \
+#            scores, scores[best_model_i], mean_losses
 
+
+def bayesian_joint_trainer(model: BranchModel,
+                           predictors: BayesianHeads,
+                           optimizer,
+                           train_loader,
+                           epochs,
+                           scheduler=None,
+                           weights=None,
+                           early_stopping=None,
+                           samples=1,
+                           prior_w=1,
+                           test_loader=None,
+                           eval_loader=None,
+                           device='cpu'):
     scores = []
     mean_losses = []
 
     best_model = model.state_dict()
+    best_predictors = predictors.state_dict()
     best_model_i = 0
 
     model.to(device)
@@ -563,63 +1074,36 @@ def posterior_regularization_trainer(model: BranchModel,
     model.train()
     bar = tqdm(range(epochs), leave=True)
     for epoch in bar:
-        model.train()
+
         losses = []
         for i, (x, y) in enumerate(train_loader):
+            prior_w = 2 ** (len(train_loader) - i - 1) \
+                      / (2 ** len(train_loader) - 1)
+
             model.train()
-            posteriors.train()
             predictors.train()
 
             x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
+            final_pred, preds = model(x)
+            loss = nn.functional.cross_entropy(final_pred, y,
+                                               reduction='mean')
+            for i, p in enumerate(preds):
+                o, prior_loss = predictors(logits=p, branch_index=i,
+                                           samples=samples)
+                l = nn.functional.cross_entropy(o, y,
+                                                reduction='mean')
+                l = l + prior_loss * prior_w
+                # print(l)
 
-            hs = torch.stack([posteriors(branch_index=i, logits=bo)
-                              for i, bo
-                              in enumerate(bos)], 0)
-
-            # hs = hs.to(device)
-            # if hs.min() < 0 or hs.max() > 1:
-            #     hs = torch.sigmoid(hs)
-
-            preds = [p(bo) for p, bo in zip(predictors, bos)]
-            preds = torch.stack(preds + [final_pred], 0)
-
-            f_hat = preds[-1]
-            for i in reversed(range(0, len(preds) - 1)):
-                f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-
-            ps = [posteriors.get_posterior(branch_index=i,
-                                           logits=bo)
-                  for i, bo
-                  in enumerate(bos)]
-
-            kl = 0
-            for i, p in enumerate(ps):
-                print('BETA', i,
-                      p.concentration1.shape,
-                      p.concentration1[0],
-                      p.concentration0[0],
-                      hs[i][0],
-                      kl_divergence(p, prior[i]).mean())
-
-                kl += kl_divergence(p, prior[i]).mean()
-            kl *= kl_divergence_w
-
-            print(kl)
-
-            loss += kl
+                if weights is not None:
+                    l *= weights[i]
+                loss += l
 
             losses.append(loss.item())
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-            # for optimizer.
-            # for n, p in posteriors.named_parameters():
-            #     print(n, p.grad)
 
         if scheduler is not None:
             if isinstance(scheduler, (StepLR, MultiStepLR)):
@@ -628,8 +1112,8 @@ def posterior_regularization_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
+            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)
         else:
             eval_scores = 0
 
@@ -644,8 +1128,10 @@ def posterior_regularization_trainer(model: BranchModel,
                 break
             elif r > 0:
                 best_model = model.state_dict()
+                best_predictors = predictors.state_dict()
                 best_model_i = epoch
         else:
+            best_predictors = predictors.state_dict()
             best_model = model.state_dict()
             best_model_i = epoch
 
@@ -658,4 +1144,133 @@ def posterior_regularization_trainer(model: BranchModel,
              'Mean loss': mean_loss})
         scores.append((train_scores, eval_scores, test_scores))
 
-    return best_model, scores, scores[best_model_i], mean_losses
+    return (best_model, best_predictors), scores, scores[best_model_i] if len(
+        scores) > 0 else 0, mean_losses
+
+# def posterior_regularization_trainer(model: BranchModel,
+#                                      predictors: nn.ModuleList,
+#                                      posteriors: BayesianPosterior,
+#                                      optimizer,
+#                                      train_loader,
+#                                      epochs,
+#                                      prior: Union[
+#                                          Distribution, List[Distribution]],
+#                                      kl_divergence_w=1,
+#                                      scheduler=None,
+#                                      early_stopping=None,
+#                                      test_loader=None, eval_loader=None,
+#                                      device='cpu'):
+#     if not isinstance(prior, list):
+#         prior = [prior] * len(predictors)
+#
+#     scores = []
+#     mean_losses = []
+#
+#     best_model = model.state_dict()
+#     best_model_i = 0
+#
+#     model.to(device)
+#     predictors.to(device)
+#
+#     if early_stopping is not None:
+#         early_stopping.reset()
+#
+#     model.train()
+#     bar = tqdm(range(epochs), leave=True)
+#     for epoch in bar:
+#         model.train()
+#         losses = []
+#         for i, (x, y) in enumerate(train_loader):
+#             model.train()
+#             posteriors.train()
+#             predictors.train()
+#
+#             x, y = x.to(device), y.to(device)
+#             final_pred, bos = model(x)
+#
+#             hs = torch.stack([posteriors(branch_index=i, logits=bo)
+#                               for i, bo
+#                               in enumerate(bos)], 0)
+#
+#             # hs = hs.to(device)
+#             # if hs.min() < 0 or hs.max() > 1:
+#             #     hs = torch.sigmoid(hs)
+#
+#             preds = [p(bo) for p, bo in zip(predictors, bos)]
+#             preds = torch.stack(preds + [final_pred], 0)
+#
+#             f_hat = preds[-1]
+#             for i in reversed(range(0, len(preds) - 1)):
+#                 f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
+#
+#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+#
+#             ps = [posteriors.get_posterior(branch_index=i,
+#                                            logits=bo)
+#                   for i, bo
+#                   in enumerate(bos)]
+#
+#             kl = 0
+#             for i, p in enumerate(ps):
+#                 print('BETA', i,
+#                       p.concentration1.shape,
+#                       p.concentration1[0],
+#                       p.concentration0[0],
+#                       hs[i][0],
+#                       kl_divergence(p, prior[i]).mean())
+#
+#                 kl += kl_divergence(p, prior[i]).mean()
+#             kl *= kl_divergence_w
+#
+#             print(kl)
+#
+#             loss += kl
+#
+#             losses.append(loss.item())
+#
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
+#
+#             # for optimizer.
+#             # for n, p in posteriors.named_parameters():
+#             #     print(n, p.grad)
+#
+#         if scheduler is not None:
+#             if isinstance(scheduler, (StepLR, MultiStepLR)):
+#                 scheduler.step()
+#             elif hasattr(scheduler, 'step'):
+#                 scheduler.step()
+#
+#         if eval_loader is not None:
+#             eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
+#                                            device=device)
+#         else:
+#             eval_scores = 0
+#
+#         mean_loss = sum(losses) / len(losses)
+#         mean_losses.append(mean_loss)
+#
+#         if early_stopping is not None:
+#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+#                 else early_stopping.step(mean_loss)
+#
+#             if r < 0:
+#                 break
+#             elif r > 0:
+#                 best_model = model.state_dict()
+#                 best_model_i = epoch
+#         else:
+#             best_model = model.state_dict()
+#             best_model_i = epoch
+#
+#         train_scores = standard_eval(model, train_loader, device=device)
+#         test_scores = standard_eval(model, test_loader, device=device)
+#
+#         bar.set_postfix(
+#             {'Train score': train_scores, 'Test score': test_scores,
+#              'Eval score': eval_scores if eval_scores != 0 else 0,
+#              'Mean loss': mean_loss})
+#         scores.append((train_scores, eval_scores, test_scores))
+#
+#     return best_model, scores, scores[best_model_i], mean_losses

@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
+from typing import List
 
 import torch
 from torch import nn
 from torch.distributions import Beta, Bernoulli
 from torch.distributions.continuous_bernoulli import ContinuousBernoulli
+
+from bayesian.bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 from bayesian.utils import get_init
 
 
@@ -18,6 +21,85 @@ class BayesianPosterior(ABC, nn.Module):
     @abstractmethod
     def __call__(self, *args, **kwargs):
         raise NotImplemented
+
+    @abstractmethod
+    def __len__(self, *args, **kwargs):
+        raise NotImplemented
+
+
+class BayesianHead(nn.Module):
+    def __init__(self, output, classes, device=None):
+        super().__init__()
+
+        output = output.to('cpu')
+        inc = output.shape[1]
+        cv = nn.Conv2d(inc, 128, kernel_size=3)  # .to(device)
+        f = torch.flatten(cv(output), 1)
+
+        self.head = nn.ModuleList((BayesianCNNLayer(inc, 128, kernel_size=3,
+                                                    divergence='mmd'),
+                                   nn.Flatten(),
+                                   BayesianLinearLayer(f.shape[-1], classes,
+                                                       divergence='mmd')))
+
+    def __call__(self, logits, samples=1, *args, **kwargs):
+
+        losses = 0
+        forwards = []
+
+        for i in range(samples):
+            reg_loss = 0
+            log = logits
+            for layer in self.head:
+                if isinstance(layer, (BayesianCNNLayer, BayesianLinearLayer)):
+                    log, r = layer(log)
+                    reg_loss += r
+                else:
+                    log = layer(log)
+            losses += reg_loss
+
+            forwards.append(log)
+
+        o = torch.stack(forwards).mean(0)
+        l = losses / logits.size(0)
+
+        if not self.training:
+            return o
+
+        return o, l
+
+
+class BayesianHeads(nn.Module):
+    def __init__(self, heads: List[BayesianHead]):
+        super().__init__()
+
+        self.predictors = nn.ModuleList(heads)
+
+    def __getitem__(self, item):
+        return self.predictors[item]
+
+    def __len__(self):
+        return len(self.predictors)
+
+    def __call__(self, logits, branch_index, samples=1, *args, **kwargs):
+        losses = 0
+        forwards = []
+
+        for i in range(samples):
+            reg_loss = 0
+            log = logits
+            log, r = self.predictors[branch_index](log)
+            losses += reg_loss
+
+            forwards.append(log)
+
+        o = torch.stack(forwards).mean(0)
+        l = losses / logits.size(0)
+
+        if not self.training:
+            return o
+
+        return o, l
 
 
 class MatrixEmbedding(BayesianPosterior):
@@ -118,6 +200,9 @@ class LayerEmbeddingContBernoulli(BayesianPosterior):
         super().__init__()
         self.alpha_layers = alpha_layers
 
+    def __len__(self):
+        return len(self.alpha_layers)
+
     def get_posterior(self, logits, branch_index, **kwargs):
         a = self.alpha_layers[branch_index](logits)
         # a, b = ab.chunk(2, dim=1)
@@ -128,10 +213,10 @@ class LayerEmbeddingContBernoulli(BayesianPosterior):
         distribution = ContinuousBernoulli(a)
         return distribution
 
-    def __call__(self, logits, branch_index, sample_shape=1, *args, **kwargs):
+    def __call__(self, logits, branch_index, samples=1, *args, **kwargs):
         # ab = self.beta_layer[branch_index](logits)
         # a, b = ab.chunk(2, dim=1)
         # distribution = Beta(a, b)
         # return distribution.rsample([sample_shape]).mean(0)
         post = self.get_posterior(logits=logits, branch_index=branch_index)
-        return post.rsample([sample_shape]).mean(0)
+        return post.rsample([samples]).mean(0)

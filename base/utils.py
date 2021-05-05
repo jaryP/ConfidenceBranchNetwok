@@ -15,19 +15,19 @@ def gaussian_kernel(a, b, gamma=None):
     a = a.squeeze()
     b = b.squeeze()
 
-    assert len(a.shape) == len(b.shape) == 1
+    # assert len(a.shape) == len(b.shape) == 1
     if gamma is None:
         gamma = a.shape[0]
     diff = a.unsqueeze(1) - b.unsqueeze(0)
 
-    numerator = diff.pow(2).mean(1)/gamma
+    numerator = diff.pow(2).mean(1) / gamma
     return torch.exp(-numerator)
 
 
 def mmd(a, b, gamma=None):
     return gaussian_kernel(a, a, gamma).mean() + \
            gaussian_kernel(b, b, gamma).mean() - \
-           2*gaussian_kernel(a, b, gamma).mean()
+           2 * gaussian_kernel(a, b, gamma).mean()
 
 
 class EarlyStopping:
@@ -120,7 +120,7 @@ def get_model(name, input_size=None, output=None):
     return model
 
 
-def get_dataset(name, model_name):
+def get_dataset(name, model_name, augment=False):
     eval_set = None
 
     if name == 'mnist':
@@ -128,6 +128,7 @@ def get_dataset(name, model_name):
              torchvision.transforms.ToTensor(),
              torchvision.transforms.Normalize((0.1307,), (0.3081,)),
              ]
+
         if model_name == 'lenet-300-100':
             t.append(torch.nn.Flatten())
 
@@ -175,12 +176,18 @@ def get_dataset(name, model_name):
         input_size = 28 * 28
 
     elif name == 'svhn':
-        tt = [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4376821, 0.4437697, 0.47280442),
-                                 (0.19803012, 0.20101562, 0.19703614))]
+        if augment:
+            tt = [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4376821, 0.4437697, 0.47280442),
+                                     (0.19803012, 0.20101562, 0.19703614))]
+        else:
+            tt = [
+                transforms.ToTensor(),
+                transforms.Normalize((0.4376821, 0.4437697, 0.47280442),
+                                     (0.19803012, 0.20101562, 0.19703614))]
 
         t = [
             transforms.ToTensor(),
@@ -205,18 +212,26 @@ def get_dataset(name, model_name):
         input_size, classes = 3, 10
 
     elif name == 'cifar10':
-        tt = [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010))
-        ]
+        if augment:
+            tt = [transforms.RandomCrop(32, padding=4),
+                  transforms.RandomHorizontalFlip(),
+                  transforms.ToTensor(),
+                  transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                       (0.2023, 0.1994, 0.2010))
+                  ]
+        else:
+            tt = [transforms.ToTensor(),
+                  transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                       (0.2023, 0.1994, 0.2010))]
 
         t = [
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465),
                                  (0.2023, 0.1994, 0.2010))]
+
+        # if model_name == 'alexnet':
+        #     t.extend([transforms.Resize(256), transforms.CenterCrop(224)])
+        #     tt.extend([transforms.Resize(256), transforms.CenterCrop(224)])
 
         transform = transforms.Compose(t)
         train_transform = transforms.Compose(tt)
@@ -232,17 +247,26 @@ def get_dataset(name, model_name):
         input_size, classes = 3, 10
 
     elif name == 'cifar100':
-        tt = [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010))]
+        if augment:
+            tt = [transforms.RandomCrop(32, padding=4),
+                  transforms.RandomHorizontalFlip(),
+                  transforms.ToTensor(),
+                  transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                       (0.2023, 0.1994, 0.2010))]
+        else:
+            tt = [
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                     (0.2023, 0.1994, 0.2010))]
 
         t = [
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465),
                                  (0.2023, 0.1994, 0.2010))]
+
+        # if model_name == 'alexnet':
+        #     t.extend([transforms.Resize(256), transforms.CenterCrop(224)])
+        #     tt.extend([transforms.Resize(256), transforms.CenterCrop(224)])
 
         transform = transforms.Compose(t)
         train_transform = transforms.Compose(tt)
@@ -256,47 +280,47 @@ def get_dataset(name, model_name):
             transform=transform)
 
         input_size, classes = 3, 100
-    elif name == 'tinyimagenet':
-        tt = [
-            transforms.ToTensor(),
-            # transforms.RandomCrop(56),
-            transforms.RandomResizedCrop(64),
-            transforms.RandomHorizontalFlip(),
-            transforms.Normalize((0.4802, 0.4481, 0.3975),
-                                 (0.2302, 0.2265, 0.2262))
-        ]
-
-        t = [
-            transforms.ToTensor(),
-            transforms.Normalize((0.4802, 0.4481, 0.3975),
-                                 (0.2302, 0.2265, 0.2262))
-        ]
-
-        transform = transforms.Compose(t)
-        train_transform = transforms.Compose(tt)
-
-        # train_set = TinyImageNet(
-        #     root='./datasets/tiny-imagenet-200', split='train',
-        #     transform=transform)
-
-        train_set = datasets.ImageFolder('./datasets/tiny-imagenet-200/train',
-                                         transform=train_transform)
-
-        # for x, y in train_set:
-        #     if x.shape[0] == 1:
-        #         print(x.shape[0] == 1)
-
-        # test_set = TinyImageNet(
-        #     root='./datasets/tiny-imagenet-200', split='val',
-        #     transform=train_transform)
-        test_set = datasets.ImageFolder('./datasets/tiny-imagenet-200/val',
-                                        transform=transform)
-
-        # for x, y in test_set:
-        #     if x.shape[0] == 1:
-        #         print(x.shape[0] == 1)
-
-        input_size, classes = 3, 200
+    # elif name == 'tinyimagenet':
+    #     tt = [
+    #         transforms.ToTensor(),
+    #         # transforms.RandomCrop(56),
+    #         transforms.RandomResizedCrop(64),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.Normalize((0.4802, 0.4481, 0.3975),
+    #                              (0.2302, 0.2265, 0.2262))
+    #     ]
+    #
+    #     t = [
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.4802, 0.4481, 0.3975),
+    #                              (0.2302, 0.2265, 0.2262))
+    #     ]
+    #
+    #     transform = transforms.Compose(t)
+    #     train_transform = transforms.Compose(tt)
+    #
+    #     # train_set = TinyImageNet(
+    #     #     root='./datasets/tiny-imagenet-200', split='train',
+    #     #     transform=transform)
+    #
+    #     train_set = datasets.ImageFolder('./datasets/tiny-imagenet-200/train',
+    #                                      transform=train_transform)
+    #
+    #     # for x, y in train_set:
+    #     #     if x.shape[0] == 1:
+    #     #         print(x.shape[0] == 1)
+    #
+    #     # test_set = TinyImageNet(
+    #     #     root='./datasets/tiny-imagenet-200', split='val',
+    #     #     transform=train_transform)
+    #     test_set = datasets.ImageFolder('./datasets/tiny-imagenet-200/val',
+    #                                     transform=transform)
+    #
+    #     # for x, y in test_set:
+    #     #     if x.shape[0] == 1:
+    #     #         print(x.shape[0] == 1)
+    #
+    #     input_size, classes = 3, 200
 
     else:
         assert False
@@ -309,6 +333,7 @@ def get_optimizer(optimizer: str, lr: float,
                   l1: float = 0,
                   l2: float = 0,
                   annealing=None):
+
     def l1loss(network):
         l1_loss = 0
         if l1 <= 0:
@@ -355,7 +380,6 @@ def calculate_trainable_parameters(model):
         if p.requires_grad:
             params += p.numel()
     return params
-
 
 # def train_model(model, optimizer, train_loader, epochs, scheduler,
 #                 early_stopping=None,

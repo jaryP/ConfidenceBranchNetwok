@@ -1,0 +1,9 @@
+method: joint
+name: joint
+save_path: results/cifar10/alexnet
+load: Yes
+save: Yes
+optimizer: configs/optimizers/adam.yaml
+trainer: configs/training/cifar10_alexnet.yaml
+device: 0
+fine_tuning: No

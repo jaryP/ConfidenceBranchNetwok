@@ -1,7 +1,11 @@
+import functools
+import operator
+from collections import defaultdict
+
 import torch
 from torch import nn
 
-from models.base import BranchModel
+from models.base import BranchModel, module_cost
 
 
 class AlexNet(BranchModel):
@@ -46,6 +50,44 @@ class AlexNet(BranchModel):
     def n_branches(self):
         return self.b
 
+    def computational_cost(self, sample_image):
+        costs = defaultdict(int)
+        shapes = dict()
+
+        if sample_image is None:
+            sample_image = torch.randn((1, 3, 32, 32))
+            # image_shape = (3, 32, 32)
+
+        for i in range(1, 6):
+            cc = 0
+            cl = getattr(self, 'c{}'.format(i))
+
+            cost = module_cost(sample_image, cl)
+            cc += cost
+
+            sample_image = cl(sample_image)
+            shapes[i - 1] = sample_image.clone()
+
+            if i in [2, 3, 5]:
+                cost = module_cost(sample_image, nn.MaxPool2d(kernel_size=2))
+
+                sample_image = nn.functional.max_pool2d(sample_image,
+                                                        kernel_size=2)
+                cc += cost
+
+            costs[i - 1] += cc
+            if i > 1:
+                costs[i - 1] += costs[i - 2]
+
+        sample_image = torch.flatten(sample_image, 1)
+
+        cost = module_cost(sample_image,  self.fc_layers)
+
+        shapes['final'] = sample_image.clone()
+        costs['final'] = costs[self.n_branches() - 1] + cost
+
+        return dict(costs), shapes
+
     def forward(self, x):
         intermediate_layers = []
 
@@ -86,3 +128,9 @@ class AlexNet(BranchModel):
         fc = self.fc_layers(flatten)
 
         return fc, intermediate_layers
+
+
+if __name__ == '__main__':
+    model = AlexNet()
+    c = model.computational_cost()
+    print(c)

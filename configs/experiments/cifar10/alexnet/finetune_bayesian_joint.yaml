@@ -1,0 +1,11 @@
+method: bayesian_joint
+name: finetune_bayesian_joint
+save_path: results/cifar10/alexnet
+load: Yes
+save: Yes
+optimizer: configs/optimizers/adam.yaml
+trainer: configs/training/cifar10_alexnet.yaml
+device: 0
+fine_tuning: Yes
+test_samples: 2
+train_samples: 1

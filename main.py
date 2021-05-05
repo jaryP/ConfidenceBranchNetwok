@@ -4,6 +4,7 @@ import sys
 from builtins import print
 from collections import defaultdict
 from itertools import chain
+from typing import Union
 
 import numpy as np
 import torch
@@ -23,10 +24,16 @@ import yaml
 import logging
 import argparse
 
-from base.evaluators import branches_entropy, branches_eval
+from torch.distributions import ContinuousBernoulli
+
+from base.evaluators import branches_entropy, branches_eval, standard_eval, \
+    branches_binary, eval_branches_entropy
 from base.trainer import joint_trainer, standard_trainer, \
-    output_combiner_trainer
+    output_combiner_trainer, binary_classifier_trainer, bayesian_joint_trainer, \
+    posterior_classifier_trainer
 from base.utils import get_optimizer, EarlyStopping, get_dataset, get_model
+from bayesian.posteriors import BayesianHead, BayesianHeads, \
+    LayerEmbeddingContBernoulli
 
 
 def ensures_path(path):
@@ -45,7 +52,7 @@ parser.add_argument('--device',
                     required=False,
                     default=None,
                     type=int,
-                    help='sum the integers (default: find the max)')
+                    help='')
 
 args = parser.parse_args()
 
@@ -102,7 +109,8 @@ for experiment in args.files:
 
     train, test, eval, input_size, classes = get_dataset(trainer['dataset'],
                                                          model_name=trainer[
-                                                             'model'])
+                                                             'model'],
+                                                         augment=False)
 
     train_loader = torch.utils.data.DataLoader(dataset=train,
                                                batch_size=batch_size,
@@ -181,6 +189,7 @@ for experiment in args.files:
         model.to(device)
 
         predictors = None
+        binaries = None
 
         if experiment_config.get('fine_tuning', False):
 
@@ -193,8 +202,9 @@ for experiment in args.files:
             if to_load and os.path.exists(p):
                 logger.info('Base model loaded.')
 
-                model_state_dict = torch.load(p)
+                model_state_dict = torch.load(p, map_location=device)
                 model.load_state_dict(model_state_dict)
+
             else:
                 logger.info('Base model training.')
 
@@ -218,14 +228,18 @@ for experiment in args.files:
                                                             fine_tune_trainer[
                                                                 'epochs'],
                                                             scheduler=None,
-                                                            early_stopping=None,
+                                                            early_stopping=early_stopping,
                                                             test_loader=test_loader,
                                                             eval_loader=eval_loader,
                                                             device=device)
                 model.load_state_dict(best_base_model)
                 torch.save(best_base_model, p)
 
-        if method_name == 'joint' or method_name == 'combine_output':
+            s = standard_eval(model, test_loader, topk=[1, 5],
+                              device=device)
+            logger.info('Base model scores: {}'.format(s))
+
+        if method_name == 'joint' or method_name == 'combined_output':
             predictors = nn.ModuleList()
             predictors.to(device)
 
@@ -270,11 +284,11 @@ for experiment in args.files:
                         train_loader=train_loader,
                         epochs=epochs,
                         scheduler=None,
-                        early_stopping=None,
+                        early_stopping=early_stopping,
                         test_loader=test_loader,
                         eval_loader=eval_loader,
                         device=device)
-                elif method_name == 'combine_output':
+                elif method_name == 'combined_output':
                     weights = experiment_config.get('weights')
                     convex_combination = experiment_config. \
                         get('convex_combination', False)
@@ -287,7 +301,7 @@ for experiment in args.files:
                             train_loader=train_loader,
                             epochs=epochs,
                             scheduler=None,
-                            early_stopping=None,
+                            early_stopping=early_stopping,
                             weights=weights,
                             convex_combination=convex_combination,
                             test_loader=test_loader,
@@ -303,22 +317,362 @@ for experiment in args.files:
                 torch.save(best_predictors,
                            os.path.join(seed_path, 'predictors.pt'))
 
-        if method_name in ['joint']:
+        elif method_name == 'binary':
+            predictors = nn.ModuleList()
+            binaries = nn.ModuleList()
+
+            x, y = next(iter(train_loader))
+            _, outputs = model(x.to(device))
+
+            for o in outputs:
+                inc = o.shape[1]
+                bf = torch.flatten(o, 1)
+
+                cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
+                cv1 = nn.MaxPool2d(kernel_size=2).to(device)
+                f = torch.flatten(cv1(cv(o)), 1)
+
+                predictors.append(
+                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                  nn.ReLU(),
+                                  nn.MaxPool2d(kernel_size=2),
+                                  nn.Dropout(0.5),
+                                  nn.Flatten(),
+                                  nn.Linear(f.shape[-1], classes)))
+                binaries.append(
+                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                  nn.ReLU(),
+                                  nn.MaxPool2d(kernel_size=2),
+                                  nn.Dropout(0.5),
+                                  nn.Flatten(),
+                                  nn.Linear(f.shape[-1], 1),
+                                  nn.Sigmoid()))
+
+            predictors.to(device)
+            binaries.to(device)
+
+            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
+                # model_state_dict = torch.load(seed_path)
+                # model.load_state_dict(model_state_dict)
+
+                md = torch.load(os.path.join(seed_path, 'model.pt'),
+                                map_location=device)
+                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
+                                map_location=device)
+                bd = torch.load(os.path.join(seed_path,
+                                             'binary_classifiers.pt'),
+                                map_location=device)
+
+                model.load_state_dict(md)
+                predictors.load_state_dict(pd)
+                binaries.load_state_dict(bd)
+            else:
+
+                opt = optimizer(chain(model.parameters(),
+                                      predictors.parameters(),
+                                      binaries.parameters()))
+
+                # if method_name == 'joint':
+                (best_model, best_predictors,
+                 best_binaries), _, _, _ = binary_classifier_trainer(
+                    model=model,
+                    predictors=predictors,
+                    binary_classifiers=binaries,
+                    optimizer=opt,
+                    train_loader=train_loader,
+                    epochs=epochs,
+                    scheduler=None,
+                    energy_w=experiment_config.get('energy_w', 1e-8),
+                    early_stopping=early_stopping,
+                    test_loader=test_loader,
+                    eval_loader=eval_loader,
+                    device=device)
+
+                # elif method_name == 'combined_output':
+                #     weights = experiment_config.get('weights')
+                #     convex_combination = experiment_config. \
+                #         get('convex_combination', False)
+                #
+                #     (best_model, best_predictors), _, _, _ = \
+                #         output_combiner_trainer(
+                #             model=model,
+                #             predictors=predictors,
+                #             optimizer=opt,
+                #             train_loader=train_loader,
+                #             epochs=epochs,
+                #             scheduler=None,
+                #             early_stopping=None,
+                #             weights=weights,
+                #             convex_combination=convex_combination,
+                #             test_loader=test_loader,
+                #             eval_loader=eval_loader,
+                #             device=device)
+                # else:
+                #     assert False
+
+                model.load_state_dict(best_model)
+                predictors.load_state_dict(best_predictors)
+                binaries.load_state_dict(best_binaries)
+
+                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
+                torch.save(best_predictors,
+                           os.path.join(seed_path, 'predictors.pt'))
+                torch.save(best_binaries,
+                           os.path.join(seed_path, 'binary_classifiers.pt'))
+
+        elif method_name == 'bayesian_joint':
+            # predictors = nn.ModuleList()
+            # predictors.to(device)
+
+            x, y = next(iter(train_loader))
+            _, outputs = model(x.to(device))
+
+            heads = []
+
+            for o in outputs:
+                h = BayesianHead(o, classes, device)
+                heads.append(h)
+
+            predictors = BayesianHeads(heads)
+
+            predictors.to(device)
+
+            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
+                # model_state_dict = torch.load(seed_path)
+                # model.load_state_dict(model_state_dict)
+
+                md = torch.load(os.path.join(seed_path, 'model.pt'),
+                                map_location=device)
+                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
+                                map_location=device)
+
+                model.load_state_dict(md)
+                predictors.load_state_dict(pd)
+
+            else:
+
+                opt = optimizer(chain(model.parameters(),
+                                      predictors.parameters()))
+
+                if method_name == 'bayesian_joint':
+                    (best_model,
+                     best_predictors), _, _, _ = bayesian_joint_trainer(
+                        model=model,
+                        predictors=predictors,
+                        optimizer=opt,
+                        train_loader=train_loader,
+                        epochs=epochs,
+                        scheduler=None,
+                        early_stopping=early_stopping,
+                        samples=experiment_config.get('train_samples', 1),
+                        test_loader=test_loader,
+                        eval_loader=eval_loader,
+                        prior_w=experiment_config.get('prior_w', 1),
+                        device=device)
+
+                # elif method_name == 'combined_output':
+                #     weights = experiment_config.get('weights')
+                #     convex_combination = experiment_config. \
+                #         get('convex_combination', False)
+                #
+                #     (best_model, best_predictors), _, _, _ = \
+                #         output_combiner_trainer(
+                #             model=model,
+                #             predictors=predictors,
+                #             optimizer=opt,
+                #             train_loader=train_loader,
+                #             epochs=epochs,
+                #             scheduler=None,
+                #             early_stopping=None,
+                #             weights=weights,
+                #             convex_combination=convex_combination,
+                #             test_loader=test_loader,
+                #             eval_loader=eval_loader,
+                #             device=device)
+                else:
+                    assert False
+
+                model.load_state_dict(best_model)
+                predictors.load_state_dict(best_predictors)
+
+                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
+                torch.save(best_predictors,
+                           os.path.join(seed_path, 'predictors.pt'))
+
+        # elif method_name == 'bayesian_binary':
+        #     predictors = nn.ModuleList()
+        #     binaries = nn.ModuleList()
+        #
+        #     x, y = next(iter(train_loader))
+        #     _, outputs = model(x.to(device))
+        #
+        #     for o in outputs:
+        #         inc = o.shape[1]
+        #         bf = torch.flatten(o, 1)
+        #         cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
+        #         f = torch.flatten(cv(o), 1)
+        #
+        #         predictors.append(
+        #             nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+        #                           nn.Flatten(),
+        #                           nn.Linear(f.shape[-1], classes)))
+        #         binaries.append(
+        #             nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+        #                           nn.Flatten(),
+        #                           nn.Linear(f.shape[-1], 1),
+        #                           nn.Sigmoid()))
+        #
+        #     posteriors = LayerEmbeddingContBernoulli(alpha_layers=binaries)
+        #
+        #     predictors.to(device)
+        #     posteriors.to(device)
+        #
+        #     if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
+        #         # model_state_dict = torch.load(seed_path)
+        #         # model.load_state_dict(model_state_dict)
+        #
+        #         md = torch.load(os.path.join(seed_path, 'model.pt'),
+        #                         map_location=device)
+        #         pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
+        #                         map_location=device)
+        #         bd = torch.load(os.path.join(seed_path,
+        #                                      'posteriors.pt'),
+        #                         map_location=device)
+        #
+        #         model.load_state_dict(md)
+        #         predictors.load_state_dict(pd)
+        #         posteriors.load_state_dict(bd)
+        #     else:
+        #
+        #         opt = optimizer(chain(model.parameters(),
+        #                               predictors.parameters(),
+        #                               posteriors.parameters()))
+        #
+        #         prior = ContinuousBernoulli(torch.tensor([0.2], device=device))
+        #
+        #         # if method_name == 'joint':
+        #         (best_model, best_predictors,
+        #          best_binaries), _, _, _ = posterior_classifier_trainer(
+        #             model=model,
+        #             predictors=predictors,
+        #             posteriors=posteriors,
+        #             optimizer=opt,
+        #             prior=prior,
+        #             prior_w=experiment_config.get('prior_w', 0.1),
+        #             entropy_w=experiment_config.get('entropy_w', 1),
+        #             train_loader=train_loader,
+        #             epochs=epochs,
+        #             use_mmd=experiment_config.get('mmd', False),
+        #             scheduler=None,
+        #             early_stopping=early_stopping,
+        #             test_loader=test_loader,
+        #             eval_loader=eval_loader,
+        #             device=device,
+        #             cumulative_prior=False)
+        #
+        #         # elif method_name == 'combined_output':
+        #         #     weights = experiment_config.get('weights')
+        #         #     convex_combination = experiment_config. \
+        #         #         get('convex_combination', False)
+        #         #
+        #         #     (best_model, best_predictors), _, _, _ = \
+        #         #         output_combiner_trainer(
+        #         #             model=model,
+        #         #             predictors=predictors,
+        #         #             optimizer=opt,
+        #         #             train_loader=train_loader,
+        #         #             epochs=epochs,
+        #         #             scheduler=None,
+        #         #             early_stopping=None,
+        #         #             weights=weights,
+        #         #             convex_combination=convex_combination,
+        #         #             test_loader=test_loader,
+        #         #             eval_loader=eval_loader,
+        #         #             device=device)
+        #         # else:
+        #         #     assert False
+        #
+        #         model.load_state_dict(best_model)
+        #         predictors.load_state_dict(best_predictors)
+        #         posteriors.load_state_dict(best_binaries)
+        #
+        #         torch.save(best_model, os.path.join(seed_path, 'model.pt'))
+        #         torch.save(best_predictors,
+        #                    os.path.join(seed_path, 'predictors.pt'))
+        #         torch.save(best_binaries,
+        #                    os.path.join(seed_path, 'posteriors.pt'))
+        else:
+            assert False, 'Accepted methods: joint, combined_output, binary'
+
+        if method_name in ['joint',
+                           'combined_output',
+                           'binary',
+                           'bayesian_joint',
+                           'bayesian_binary']:
+
             s = branches_eval(model, predictors, test_loader, device=device)
             logger.info('Branches scores {}'.format(s))
 
+            logger.info('Percentile entropy experiment')
+
+            ps = experiment_config.get('entropy_threshold',
+                                       [0.1, 0.15,
+                                        0.20, 0.25,
+                                        0.30, 0.5, 0.75])
+            if isinstance(ps, float):
+                ps = [ps]
+
+            for p in ps:
+                s, c = eval_branches_entropy(model,
+                                             predictors,
+                                             percentile=p,
+                                             dataset_loader=test_loader,
+                                             eval_loader=eval_loader,
+                                             device=device)
+
+                logger.info('Percentile: {}'.format(p))
+                logger.info('\tScores: {}'.format(s))
+                logger.info('\tCounters: {}'.format(c))
+
             logger.info('Branches entropy experiment')
-            for h in [0.05, 0.1, 0.25, 0.5, 0.75]:
+            th = experiment_config.get('entropy_threshold',
+                                       [0.001, 0.01,
+                                        0.05, 0.1,
+                                        0.25, 0.5, 0.75])
+            if isinstance(th, float):
+                th = [th]
+
+            for h in th:
                 s, c = branches_entropy(model=model,
                                         threshold=h,
                                         dataset_loader=test_loader,
                                         predictors=predictors,
-                                        device=device)
+                                        device=device,
+                                        samples=
+                                        experiment_config.get('test_samples',
+                                                              1))
 
                 logger.info('Threshold: {}'.format(h))
                 logger.info('\tCumulative score: {}'.format(s['global']))
                 logger.info('\tScores: {}'.format(s))
                 logger.info('\tCounters: {}'.format(c))
+
+        if method_name == 'binary' or method_name == 'bayesian_binary':
+            th = experiment_config.get('binary_threshold', 0.5)
+
+            # s = branches_eval(model, predictors, test_loader, device=device)
+            # logger.info('Branches scores {}'.format(s))
+
+            logger.info('Branches binary experiment')
+            s, c = branches_binary(model=model,
+                                   binary_classifiers=binaries,
+                                   dataset_loader=test_loader,
+                                   predictors=predictors,
+                                   threshold=th,
+                                   device=device)
+
+            logger.info('\tScores: {}'.format(s))
+            logger.info('\tCounters: {}'.format(c))
 
         # if method_name is None or method_name == 'normal':
         #     method_name = 'normal'
@@ -343,8 +697,8 @@ for experiment in args.files:
         # elif method_name == 'snapshot':
         #     method = Snapshot(model=model, method_parameters=method_parameters,
         #                       device=device)
-        else:
-            assert False
+        # else:
+        #     assert False
 
         # logger.info('Method used: {}'.format(method_name))
 
