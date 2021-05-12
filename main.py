@@ -28,12 +28,14 @@ from torch.distributions import ContinuousBernoulli
 
 from base.evaluators import branches_entropy, branches_eval, standard_eval, \
     branches_binary, eval_branches_entropy
+from base.plots import plot_branches_entropy, plot_branches_binary
 from base.trainer import joint_trainer, standard_trainer, \
     output_combiner_trainer, binary_classifier_trainer, bayesian_joint_trainer, \
-    posterior_classifier_trainer
+    posterior_classifier_trainer, branching_trainer
 from base.utils import get_optimizer, EarlyStopping, get_dataset, get_model
 from bayesian.posteriors import BayesianHead, BayesianHeads, \
-    LayerEmbeddingContBernoulli
+    LayerEmbeddingContBernoulli, LayerEmbeddingBeta
+from models.base import branches_predictions
 
 
 def ensures_path(path):
@@ -53,6 +55,8 @@ parser.add_argument('--device',
                     default=None,
                     type=int,
                     help='')
+
+parser.add_argument('--plot', action='store_true')
 
 args = parser.parse_args()
 
@@ -171,9 +175,10 @@ for experiment in args.files:
             train_loader = torch.utils.data.DataLoader(dataset=train,
                                                        batch_size=batch_size,
                                                        shuffle=True)
-            eval_loader = torch.utils.data.DataLoader(dataset=eval,
-                                                      batch_size=batch_size,
-                                                      shuffle=False)
+            eval_loader = torch.utils.data.DataLoader(
+                dataset=eval,
+                batch_size=batch_size,
+                shuffle=False)
 
             logger.info('Train dataset size: {}'.format(len(train)))
             logger.info('Test dataset size: {}'.format(len(test)))
@@ -241,7 +246,6 @@ for experiment in args.files:
 
         if method_name == 'joint' or method_name == 'combined_output':
             predictors = nn.ModuleList()
-            predictors.to(device)
 
             x, y = next(iter(train_loader))
             _, outputs = model(x.to(device))
@@ -262,6 +266,8 @@ for experiment in args.files:
             if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
                 # model_state_dict = torch.load(seed_path)
                 # model.load_state_dict(model_state_dict)
+
+                logger.info('Model loaded.')
 
                 md = torch.load(os.path.join(seed_path, 'model.pt'),
                                 map_location=device)
@@ -336,17 +342,20 @@ for experiment in args.files:
                     nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
                                   nn.ReLU(),
                                   nn.MaxPool2d(kernel_size=2),
-                                  nn.Dropout(0.5),
+                                  nn.Dropout(0.25),
                                   nn.Flatten(),
                                   nn.Linear(f.shape[-1], classes)))
+
                 binaries.append(
                     nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
                                   nn.ReLU(),
                                   nn.MaxPool2d(kernel_size=2),
-                                  nn.Dropout(0.5),
+                                  nn.Dropout(0.25),
                                   nn.Flatten(),
                                   nn.Linear(f.shape[-1], 1),
                                   nn.Sigmoid()))
+
+                torch.nn.init.constant_(binaries[-1][-2].bias, -10.0)
 
             predictors.to(device)
             binaries.to(device)
@@ -354,6 +363,7 @@ for experiment in args.files:
             if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
                 # model_state_dict = torch.load(seed_path)
                 # model.load_state_dict(model_state_dict)
+                logger.info('Model loaded.')
 
                 md = torch.load(os.path.join(seed_path, 'model.pt'),
                                 map_location=device)
@@ -373,6 +383,7 @@ for experiment in args.files:
                                       binaries.parameters()))
 
                 # if method_name == 'joint':
+
                 (best_model, best_predictors,
                  best_binaries), _, _, _ = binary_classifier_trainer(
                     model=model,
@@ -382,7 +393,8 @@ for experiment in args.files:
                     train_loader=train_loader,
                     epochs=epochs,
                     scheduler=None,
-                    energy_w=experiment_config.get('energy_w', 1e-8),
+                    energy_w=experiment_config.get('energy_w', 1e-3),
+                    # early_stopping=None,
                     early_stopping=early_stopping,
                     test_loader=test_loader,
                     eval_loader=eval_loader,
@@ -440,6 +452,7 @@ for experiment in args.files:
             if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
                 # model_state_dict = torch.load(seed_path)
                 # model.load_state_dict(model_state_dict)
+                logger.info('Model loaded.')
 
                 md = torch.load(os.path.join(seed_path, 'model.pt'),
                                 map_location=device)
@@ -451,8 +464,9 @@ for experiment in args.files:
 
             else:
 
-                opt = optimizer(chain(model.parameters(),
-                                      predictors.parameters()))
+                # opt = optimizer(chain(model.parameters(),
+                #                       predictors.parameters()))
+                opt = optimizer(chain(predictors.parameters()))
 
                 if method_name == 'bayesian_joint':
                     (best_model,
@@ -463,7 +477,7 @@ for experiment in args.files:
                         train_loader=train_loader,
                         epochs=epochs,
                         scheduler=None,
-                        early_stopping=early_stopping,
+                        early_stopping=None,
                         samples=experiment_config.get('train_samples', 1),
                         test_loader=test_loader,
                         eval_loader=eval_loader,
@@ -498,6 +512,149 @@ for experiment in args.files:
                 torch.save(best_model, os.path.join(seed_path, 'model.pt'))
                 torch.save(best_predictors,
                            os.path.join(seed_path, 'predictors.pt'))
+
+        elif method_name == 'stick_breaking':
+
+            predictors = nn.ModuleList()
+
+            x, y = next(iter(train_loader))
+            _, outputs = model(x.to(device))
+
+            mx = experiment_config.get('max_clamp', 10)
+            mn = experiment_config.get('min_clamp', 0.1)
+
+            a = experiment_config.get('constant_a', None)
+            if a is not None:
+                alphas = a
+            else:
+                alphas = nn.ModuleList()
+
+            b = experiment_config.get('constant_b', None)
+            if b is not None:
+                betas = b
+            else:
+                betas = nn.ModuleList()
+
+            for o in outputs:
+                inc = o.shape[1]
+                bf = torch.flatten(o, 1)
+
+                cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
+                cv1 = nn.MaxPool2d(kernel_size=2).to(device)
+                f = torch.flatten(cv1(cv(o)), 1)
+
+                if a is None:
+                    alphas.append(
+                        nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                      nn.ReLU(),
+                                      nn.MaxPool2d(kernel_size=2),
+                                      nn.Dropout(0.25),
+                                      nn.Flatten(),
+                                      nn.Linear(f.shape[-1], 1),
+                                      nn.Hardtanh(min_val=mn, max_val=mx)))
+                if b is None:
+                    betas.append(
+                        nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                      nn.ReLU(),
+                                      nn.MaxPool2d(kernel_size=2),
+                                      nn.Dropout(0.25),
+                                      nn.Flatten(),
+                                      nn.Linear(f.shape[-1], 1),
+                                      nn.Hardtanh(min_val=mn, max_val=mx)))
+
+                predictors.append(
+                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                  nn.ReLU(),
+                                  nn.MaxPool2d(kernel_size=2),
+                                  nn.Dropout(0.25),
+                                  nn.Flatten(),
+                                  nn.Linear(f.shape[-1], classes)))
+
+                # binaries.append(
+                #     nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                #                   nn.ReLU(),
+                #                   nn.MaxPool2d(kernel_size=2),
+                #                   nn.Dropout(0.25),
+                #                   nn.Flatten(),
+                #                   nn.Linear(f.shape[-1], 1),
+                #                   nn.Sigmoid()))
+
+                # torch.nn.init.constant_(betas[-1][-2].bias, 5.0)
+                torch.nn.init.constant_(betas[-1][-2].bias, 5.0)
+
+            posteriors = LayerEmbeddingBeta(beta_layers=betas,
+                                            alpha_layers=alphas,
+                                            max_clamp=experiment_config.
+                                            get('max_clamp', None),
+                                            min_clamp=experiment_config.
+                                            get('min_clamp', None))
+
+            posteriors.to(device)
+            predictors.to(device)
+
+            # opt = Adam(chain(model.parameters(),
+            #                  predictors.parameters(),
+            #                  posteriors.parameters()),
+            #            lr=0.001, weight_decay=1e-6)
+
+            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
+                # model_state_dict = torch.load(seed_path)
+                # model.load_state_dict(model_state_dict)
+                logger.info('Model loaded.')
+
+                md = torch.load(os.path.join(seed_path, 'model.pt'),
+                                map_location=device)
+                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
+                                map_location=device)
+                dd = torch.load(os.path.join(seed_path, 'posteriors.pt'),
+                                map_location=device)
+
+                model.load_state_dict(md)
+                posteriors.load_state_dict(pd)
+                posteriors.load_state_dict(dd)
+
+            else:
+
+                opt = optimizer(chain(model.parameters(),
+                                      predictors.parameters(),
+                                      posteriors.parameters()))
+
+                # for n, m in chain(model.named_parameters(),
+                #                   predictors.named_parameters(),
+                #                   posteriors.named_parameters()):
+                #     print(n, m.requires_grad)
+                #
+                # input()
+
+                (best_model, best_predictors, best_binaries) = \
+                    branching_trainer(model,
+                                      predictors,
+                                      posteriors,
+                                      one_hot=experiment_config.get('one_hot',
+                                                                    False),
+                                      energy_reg=experiment_config.get(
+                                          'energy_reg', 1e-3),
+                                      optimizer=opt,
+                                      train_loader=train_loader,
+                                      epochs=epochs,
+                                      scheduler=None,
+                                      early_stopping=None,
+                                      test_loader=test_loader,
+                                      eval_loader=eval_loader,
+                                      device=device,
+                                      samples=experiment_config.get('samples',
+                                                                    1))[
+                        0]
+
+                model.load_state_dict(best_model)
+                predictors.load_state_dict(best_predictors)
+                posteriors.load_state_dict(best_binaries)
+
+                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
+                torch.save(best_predictors,
+                           os.path.join(seed_path, 'predictors.pt'))
+                torch.save(best_binaries,
+                           os.path.join(seed_path, 'posteriors.pt'))
 
         # elif method_name == 'bayesian_binary':
         #     predictors = nn.ModuleList()
@@ -604,15 +761,21 @@ for experiment in args.files:
         else:
             assert False, 'Accepted methods: joint, combined_output, binary'
 
+        sample_image = next(iter(train_loader))[0][1:2].to(device)
+        costs = branches_predictions(model, predictors, sample_image)
+
+        torch.save(costs, os.path.join(seed_path, 'costs.res'))
+
         if method_name in ['joint',
                            'combined_output',
                            'binary',
                            'bayesian_joint',
-                           'bayesian_binary']:
+                           'bayesian_binary',
+                           'stick_breaking']:
 
             s = branches_eval(model, predictors, test_loader, device=device)
             logger.info('Branches scores {}'.format(s))
-
+            """
             logger.info('Percentile entropy experiment')
 
             ps = experiment_config.get('entropy_threshold',
@@ -628,11 +791,15 @@ for experiment in args.files:
                                              percentile=p,
                                              dataset_loader=test_loader,
                                              eval_loader=eval_loader,
-                                             device=device)
+                                             device=device,
+                                             samples=experiment_config.
+                                             get('test_samples', 1))
 
                 logger.info('Percentile: {}'.format(p))
                 logger.info('\tScores: {}'.format(s))
-                logger.info('\tCounters: {}'.format(c))
+                logger.info('\tCounters: {}'.format(c))"""
+
+            entropy_results = {}
 
             logger.info('Branches entropy experiment')
             th = experiment_config.get('entropy_threshold',
@@ -652,12 +819,18 @@ for experiment in args.files:
                                         experiment_config.get('test_samples',
                                                               1))
 
+                entropy_results[h] = {'counters': c, 'scores': s}
+
                 logger.info('Threshold: {}'.format(h))
                 logger.info('\tCumulative score: {}'.format(s['global']))
                 logger.info('\tScores: {}'.format(s))
                 logger.info('\tCounters: {}'.format(c))
 
-        if method_name == 'binary' or method_name == 'bayesian_binary':
+                torch.save(entropy_results, os.path.join(seed_path,
+                                                         'entropy.res'))
+
+        if method_name == 'binary' or method_name == 'bayesian_binary' or \
+                method_name == 'stick_breaking':
             th = experiment_config.get('binary_threshold', 0.5)
 
             # s = branches_eval(model, predictors, test_loader, device=device)
@@ -673,6 +846,29 @@ for experiment in args.files:
 
             logger.info('\tScores: {}'.format(s))
             logger.info('\tCounters: {}'.format(c))
+
+        if args.plot:
+            figures = plot_branches_entropy(model=model,
+                                            predictors=predictors,
+                                            dataset=test_loader,
+                                            device=device,
+                                            samples=experiment_config.
+                                            get('test_samples', 1))
+
+            for i, f in enumerate(figures):
+                f.savefig(os.path.join(seed_path, 'b{}_entropy.pdf'.format(i)))
+
+            if method_name == 'binary' or method_name == 'bayesian_binary':
+                figures = plot_branches_binary(model,
+                                               binary_classifiers=binaries,
+                                               dataset=test_loader,
+                                               predictors=predictors,
+                                               device=device,
+                                               samples=1)
+
+                for i, f in enumerate(figures):
+                    f.savefig(
+                        os.path.join(seed_path, 'b{}_binary.pdf'.format(i)))
 
         # if method_name is None or method_name == 'normal':
         #     method_name = 'normal'

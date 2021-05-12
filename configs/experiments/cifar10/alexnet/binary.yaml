@@ -3,8 +3,8 @@ name: binary
 save_path: results/cifar10/alexnet
 load: Yes
 save: Yes
-optimizer: configs/optimizers/adam.yaml
+optimizer: configs/optimizers/l2_adam.yaml
 trainer: configs/training/cifar10_alexnet.yaml
 device: 0
 fine_tuning: No
-energy_w: 1.0e-3
+energy_w: 0.005

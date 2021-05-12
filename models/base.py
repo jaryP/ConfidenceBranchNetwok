@@ -10,15 +10,28 @@ def conv_cost(image_shape, m):
     kernel_ops = torch.zeros(m.weight.size()[2:]).numel()
     bias_ops = 1 if m.bias is not None else 0
 
-    nelement = reduce(mul, image_shape, 1)
+    curr_im_size = (image_shape[1] / m.stride[0], image_shape[2] / m.stride[1])
 
-    total_ops = nelement * (m.in_channels // m.groups * kernel_ops + bias_ops)
+    # nelement = reduce(mul, curr_im_size, 1)
+    #
+    # total_ops = nelement * (m.in_channels // m.groups * kernel_ops + bias_ops)
 
-    return total_ops
+    # curr_im_size = (hparams['im_size'][0] / m.stride[0], hparams['im_size'][1] / m.stride[1])
+    cost = m.kernel_size[0]*\
+           m.kernel_size[1]*\
+           m.in_channels*\
+           m.out_channels*\
+           curr_im_size[0]*\
+           curr_im_size[1]
+
+    return cost
 
 
 def maxpool_cost(image_shape, m):
-    return 0
+    curr_im_size = reduce(mul, image_shape, 1)
+    cost = image_shape[1]*image_shape[2]*image_shape[0]
+    # hparams['im_size'] = (hparams['im_size'][0]/m.kernel_size, hparams['im_size'][1]/m.kernel_size)
+    return cost
 
 
 # avgpool_cost = maxpool_cost  # To check
@@ -66,12 +79,22 @@ def branches_predictions(model, predictors, sample_image=None):
 
     final = costs['final']
 
-    for i in range(model.n_branches()):
+    # print(costs)
+    # _costs = {k: v/final for k, v in costs.items()}
+    # print(_costs)
+    # trainable_parameters = lambda model: sum([p.numel() for p in model.parameters() if p.requires_grad == True])
+    # print(trainable_parameters(model))
 
-        pc = module_cost(shapes[i], predictors[i])
-        costs[i] += pc
+    # for i in range(model.n_branches()):
+    #
+    #     pc = module_cost(shapes[i], predictors[i])
+    #     # print(i, pc)
+    #     costs[i] += pc
 
     costs = {k: v/final for k, v in costs.items()}
+
+    # print(costs)
+    # input()
 
     return costs
 

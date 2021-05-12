@@ -34,11 +34,21 @@ class BayesianHead(nn.Module):
         output = output.to('cpu')
         inc = output.shape[1]
         cv = nn.Conv2d(inc, 128, kernel_size=3)  # .to(device)
-        f = torch.flatten(cv(output), 1)
+        cv1 = nn.MaxPool2d(kernel_size=2).to(device)
+        f = torch.flatten(cv1(cv(output)), 1)
+
+        # self.head = nn.ModuleList((BayesianCNNLayer(inc, 128, kernel_size=3,
+        #                                             divergence='mmd'),
+        #                            nn.Flatten(),
+        #                            BayesianLinearLayer(f.shape[-1], classes,
+        #                                                divergence='mmd')))
 
         self.head = nn.ModuleList((BayesianCNNLayer(inc, 128, kernel_size=3,
                                                     divergence='mmd'),
-                                   nn.Flatten(),
+                                  nn.ReLU(),
+                                  nn.MaxPool2d(kernel_size=2),
+                                  nn.Dropout(0.25),
+                                  nn.Flatten(),
                                    BayesianLinearLayer(f.shape[-1], classes,
                                                        divergence='mmd')))
 
@@ -141,11 +151,22 @@ class MatrixEmbedding(BayesianPosterior):
 
 
 class LayerEmbeddingBeta(BayesianPosterior):
+    def __len__(self, *args, **kwargs):
+        return self.ln
+
     def __init__(self, alpha_layers, beta_layers, min_clamp=1e-10, max_clamp=5):
         super().__init__()
 
+        if isinstance(alpha_layers, nn.ModuleList):
+            self.ln = len(alpha_layers)
+        elif isinstance(beta_layers, nn.ModuleList):
+            self.ln = len(beta_layers)
+        else:
+            assert False
+
         self.beta_layer = beta_layers
         self.alpha_layers = alpha_layers
+
         self.min_clamp = max(1e-10, min_clamp) if min_clamp \
                                                   is not None else 1e-10
         self.max_clamp = max(self.min_clamp, max_clamp) if max_clamp \
@@ -176,23 +197,33 @@ class LayerEmbeddingBeta(BayesianPosterior):
         # self.matrix = nn.Parameter(matrix)
 
     def get_posterior(self, logits, branch_index, **kwargs):
-        a = self.alpha_layers[branch_index](logits)
-        b = self.beta_layer[branch_index](logits)
-        # a, b = ab.chunk(2, dim=1)
-        a = a.clamp(self.min_clamp, self.max_clamp)
-        b = b.clamp(self.min_clamp, self.max_clamp)
+        if isinstance(self.alpha_layers, (int, float)):
+            a = float(self.alpha_layers)
+        else:
+            a = self.alpha_layers[branch_index](logits)
+            # a = a.clamp(self.min_clamp, self.max_clamp)
+
+        if isinstance(self.beta_layer, (int, float)):
+            b = float(self.beta_layer)
+        else:
+            b = self.beta_layer[branch_index](logits)
+            # b = torch.clamp(b, min=self.min_clamp, max=self.max_clamp)
+
+        # b = self.beta_layer[branch_index](logits)
+        # # a, b = ab.chunk(2, dim=1)
+        # b = b.clamp(self.min_clamp, self.max_clamp)
         # a, b = a.clamp(0.1), b.clamp(0.1)
         # a, b = a + 1, b + 0.1
         distribution = Beta(a, b)
         return distribution
 
-    def __call__(self, logits, branch_index, sample_shape=1, *args, **kwargs):
+    def __call__(self, logits, branch_index, samples=1, *args, **kwargs):
         # ab = self.beta_layer[branch_index](logits)
         # a, b = ab.chunk(2, dim=1)
         # distribution = Beta(a, b)
         # return distribution.rsample([sample_shape]).mean(0)
         post = self.get_posterior(logits=logits, branch_index=branch_index)
-        return post.rsample([sample_shape]).mean(0)
+        return post.rsample([samples]).mean(0)
 
 
 class LayerEmbeddingContBernoulli(BayesianPosterior):

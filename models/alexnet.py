@@ -8,7 +8,7 @@ from torch import nn
 from models.base import BranchModel, module_cost
 
 
-class AlexNet(BranchModel):
+class AlexNet(BranchModel, nn.Module):
 
     def __init__(self, num_classes=10):
         super(AlexNet, self).__init__()
@@ -128,9 +128,3 @@ class AlexNet(BranchModel):
         fc = self.fc_layers(flatten)
 
         return fc, intermediate_layers
-
-
-if __name__ == '__main__':
-    model = AlexNet()
-    c = model.computational_cost()
-    print(c)

@@ -1,11 +1,13 @@
-method: joint
-name: finetune_joint
+method: bayesian_joint
+name: finetune_bayesian_joint_2
 save_path: results/cifar10/alexnet
 load: Yes
 save: Yes
 optimizer: configs/optimizers/l2_adam.yaml
 trainer: configs/training/cifar10_alexnet.yaml
-device: 0
-fine_tuning: Yes
 fine_tuning_trainer: configs/training/cifar10_alexnet.yaml
 fine_tuning_optimizer: configs/optimizers/l2_adam.yaml
+device: 0
+fine_tuning: Yes
+test_samples: 5
+train_samples: 2

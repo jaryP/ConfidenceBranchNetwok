@@ -15,7 +15,7 @@ from bayesian.posteriors import MatrixEmbedding, LayerEmbeddingBeta, \
 from models.alexnet import AlexNet
 from base.trainer import joint_trainer, output_combiner_trainer, \
     binary_classifier_trainer, posterior_classifier_trainer, \
-    binary_posterior_joint_trainer, bayesian_joint_trainer
+    binary_posterior_joint_trainer, bayesian_joint_trainer, branching_trainer
 from base.utils import get_dataset
 
 # from prototipo import branch_lenet
@@ -167,22 +167,21 @@ for o in outputs:
     #     cv = nn.Conv2d(inc, 2, kernel_size=3)
     #     o = cv(o)
     #     f = torch.flatten(o, 1)
-    betas.append(nn.Sequential(
-        # nn.Conv2d(inc, 128, kernel_size=3),
-        nn.Flatten(),
-        nn.ReLU(),
-        # nn.BatchNorm1d(bf.shape[-1]),
-        nn.Linear(bf.shape[-1], 1),
-        nn.Sigmoid()))
+    betas.append(nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                               nn.Flatten(),
+                               nn.Linear(f.shape[-1], 1),
+                               nn.ReLU()))
 
-    alphas.append(nn.Sequential(
-        # nn.Conv2d(inc, 128, kernel_size=3),
-        nn.Flatten(),
-        nn.ReLU(),
-        # nn.BatchNorm1d(bf.shape[-1]),
-        # nn.LayerNorm(),
-        nn.Linear(bf.shape[-1], 1),
-        nn.ReLU()))
+    # torch.nn.init.constant_(betas[-1][-2].bias, 20.0)
+
+    alphas.append(nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
+                                nn.Flatten(),
+                                nn.Linear(f.shape[-1], 1),
+                                nn.ReLU()))
+
+# torch.nn.init.constant_(betas[0][-2].bias, 10.0)
+# torch.nn.init.constant_(betas[1][-2].bias, 5.0)
+# torch.nn.init.constant_(betas[2][-2].bias, 1.0)
 
 predicts_dict = predictors.state_dict()
 predictors.to(DEVICE)
@@ -281,10 +280,37 @@ alphas.to(DEVICE)
 # model.load_state_dict(best_base_model)
 # predictors.load_state_dict(predicts_dict)
 
+# p = 'results/models/alexnet_0.pt'
+#
+# model_state_dict = torch.load(p, map_location=DEVICE)
+# model.load_state_dict(model_state_dict)
+# print(branches_eval(model, predictors, test_loader, device=DEVICE))
+# input()
+
 # posteriors = MatrixEmbedding(size=model.branches, distribution='beta')
 # posteriors = LayerEmbeddingBeta(beta_layers=betas, alpha_layers=alphas,
 #                                 max_clamp=5, min_clamp=0.1)
-posteriors = LayerEmbeddingContBernoulli(alpha_layers=betas)
+posteriors = LayerEmbeddingBeta(beta_layers=betas, alpha_layers=1,
+                                max_clamp=10, min_clamp=1)
+# posteriors = LayerEmbeddingContBernoulli(alpha_layers=betas)
+
+opt = Adam(chain(model.parameters(),
+                 predictors.parameters(),
+                 posteriors.parameters()),
+           lr=0.001, weight_decay=1e-6)
+
+branching_trainer(model,
+                  predictors,
+                  posteriors,
+                  optimizer=opt,
+                  train_loader=train_loader,
+                  epochs=50,
+                  energy_w=1,
+                  scheduler=None,
+                  early_stopping=None,
+                  test_loader=test_loader, eval_loader=eval_set, device=DEVICE)
+
+exit()
 # for h in [0.1, 0.25, 0.5, 0.75]:
 #     s = branches_entropy(model=model,
 #                          threshold=h,
@@ -310,6 +336,8 @@ prior = [ContinuousBernoulli(0.1),
          ContinuousBernoulli(0.9)]
 # posterior_regularization_trainer
 
+prior = ContinuousBernoulli(0.2)
+
 opt = Adam(chain(model.parameters(),
                  predictors.parameters(),
                  posteriors.parameters()),
@@ -321,7 +349,7 @@ best_base_model, _, best_scores, _ = posterior_classifier_trainer(model=model,
                                                                   optimizer=opt,
                                                                   prior=prior,
                                                                   prior_w=0.001,
-                                                                  energy_w=1e-10,
+                                                                  energy_w=1e-6,
                                                                   train_loader=train_loader,
                                                                   epochs=5,
                                                                   use_mmd=False,
