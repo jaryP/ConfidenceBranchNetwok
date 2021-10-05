@@ -6,6 +6,66 @@ import torch
 from torch import nn
 
 
+class IntermediateBranch(nn.Module):
+    def __init__(self, classifier: nn.Module,
+                 preprocessing: nn.Module = None):
+        super().__init__()
+        self.preprocessing = preprocessing if preprocessing is not None \
+            else lambda x: x
+
+        self.classifier = classifier
+
+    def preprocess(self, x):
+        return self.preprocessing(x)
+
+    def logits(self, x):
+        embs = self.preprocess(x)
+        logits = self.classifier(embs)
+
+        return logits
+
+    def forward(self, x):
+        embs = self.preprocess(x)
+        logits = self.classifier(embs)
+
+        return logits
+
+
+class BinaryIntermediateBranch(IntermediateBranch):
+    def __init__(self, classifier: nn.Module,
+                 binary_classifier: nn.Module = None,
+                 constant_binary_output=None,
+                 preprocessing: nn.Module = None):
+
+        super().__init__(classifier, preprocessing)
+
+        if binary_classifier is None and constant_binary_output is None:
+            assert False
+
+        if binary_classifier is None:
+            if not isinstance(constant_binary_output, (float, int)):
+                assert False
+
+            binary_classifier = lambda x: torch.full((x.shape[0], 1),
+                                                     constant_binary_output,
+                                                     device=x.device)
+
+        self.binary_classifier = binary_classifier
+
+    def logits(self, x):
+        embs = self.preprocess(x)
+        logits = self.classifier(embs)
+
+        return logits
+
+    def forward(self, x):
+        embs = self.preprocess(x)
+        logits = self.classifier(embs)
+        bin = self.binary_classifier(embs)
+
+        return logits, bin
+
+
 def conv_cost(image_shape, m):
     kernel_ops = torch.zeros(m.weight.size()[2:]).numel()
     bias_ops = 1 if m.bias is not None else 0
@@ -17,11 +77,11 @@ def conv_cost(image_shape, m):
     # total_ops = nelement * (m.in_channels // m.groups * kernel_ops + bias_ops)
 
     # curr_im_size = (hparams['im_size'][0] / m.stride[0], hparams['im_size'][1] / m.stride[1])
-    cost = m.kernel_size[0]*\
-           m.kernel_size[1]*\
-           m.in_channels*\
-           m.out_channels*\
-           curr_im_size[0]*\
+    cost = m.kernel_size[0] * \
+           m.kernel_size[1] * \
+           m.in_channels * \
+           m.out_channels * \
+           curr_im_size[0] * \
            curr_im_size[1]
 
     return cost
@@ -29,7 +89,7 @@ def conv_cost(image_shape, m):
 
 def maxpool_cost(image_shape, m):
     curr_im_size = reduce(mul, image_shape, 1)
-    cost = image_shape[1]*image_shape[2]*image_shape[0]
+    cost = image_shape[1] * image_shape[2] * image_shape[0]
     # hparams['im_size'] = (hparams['im_size'][0]/m.kernel_size, hparams['im_size'][1]/m.kernel_size)
     return cost
 
@@ -37,7 +97,7 @@ def maxpool_cost(image_shape, m):
 # avgpool_cost = maxpool_cost  # To check
 def avgpool_cost(image_shape, m):
     c = reduce(mul, image_shape, 1)
-    return c
+    return 0
 
 
 def dense_cost(image_shape, m):
@@ -66,7 +126,7 @@ def module_cost(input_sample, m):
         cost = avgpool_cost(image_shape, m)
     elif isinstance(m, nn.Linear):
         cost = dense_cost(image_shape, m)
-    elif isinstance(m, nn.Sequential): # == ['Sequential', 'BasicBlock']:
+    elif isinstance(m, nn.Sequential):  # == ['Sequential', 'BasicBlock']:
         cost = sequential_cost(input_sample, m)
     else:
         cost = 0
@@ -91,7 +151,7 @@ def branches_predictions(model, predictors, sample_image=None):
     #     # print(i, pc)
     #     costs[i] += pc
 
-    costs = {k: v/final for k, v in costs.items()}
+    costs = {k: v / final for k, v in costs.items()}
 
     # print(costs)
     # input()
@@ -110,7 +170,6 @@ class BranchModel(ABC, nn.Module):
     @abstractmethod
     def computational_cost(self, image_shape):
         raise NotImplemented
-
 
 # def main(args):
 #     from models.alexnet import AlexNet

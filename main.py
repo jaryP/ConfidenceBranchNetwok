@@ -1,938 +1,840 @@
+import logging
 import os
-import pickle
-import sys
-from builtins import print
-from collections import defaultdict
+import warnings
 from itertools import chain
-from typing import Union
 
+import hydra
 import numpy as np
 import torch
-import torch.nn as nn
-# from experiments.calibration import ece_score
-# from eval import eval_method
-# from experiments.corrupted_cifar import corrupted_cifar_uncertainty
-# from experiments.fgsm import perturbed_predictions
-# from methods import SingleModel, Naive, SuperMask
-# from methods.batch_ensemble.batch_ensemble import BatchEnsemble
-# from methods.dropout.dropout import MCDropout
-# from methods.snapshot.snapshot import Snapshot
-# from methods.supermask.supermask import ExtremeBatchPruningSuperMask
-# from utils import get_optimizer, get_dataset, get_model, EarlyStopping, \
-#     ensures_path, calculate_trainable_parameters
-import yaml
-import logging
-import argparse
+from matplotlib import pyplot as plt
+from omegaconf import DictConfig, OmegaConf
+from torch import optim
 
-from torch.distributions import ContinuousBernoulli
-
-from base.evaluators import branches_entropy, branches_eval, standard_eval, \
-    branches_binary, eval_branches_entropy
-from base.plots import plot_branches_entropy, plot_branches_binary
-from base.trainer import joint_trainer, standard_trainer, \
-    output_combiner_trainer, binary_classifier_trainer, bayesian_joint_trainer, \
-    posterior_classifier_trainer, branching_trainer
-from base.utils import get_optimizer, EarlyStopping, get_dataset, get_model
-from bayesian.posteriors import BayesianHead, BayesianHeads, \
-    LayerEmbeddingContBernoulli, LayerEmbeddingBeta
-from models.base import branches_predictions
+# from evaluators import accuracy_score, get_probabilities, ece_score, \
+#     one_pixel_attack
+# from loss_landscape_branch.evaluators import dirichlet_evaluator, \
+#     exit_evaluator, dirichlet_forward
+# # from loss_landscape.plots.embedding_plots import flat_embedding_plots, \
+# #     flat_embedding_cosine_similarity_plot
+# from loss_landscape_branch.plots.embedding_plots import flat_embedding_plots, \
+#     flat_logits_plots
+# from loss_landscape_branch.trainers import dirichlet_model_train, \
+#     dirichlet_logits_model_train, joint_train
+# from loss_landscape_branch.models.alexnet import AlexNet
+# from loss_landscape_branch.utils import get_intermediate_classifiers, \
+#     DirichletLogits, BranchExit, DirichletEmbeddings
+from base.trainer import binary_bernulli_trainer
+from utils import get_dataset, get_optimizer, get_model
 
 
-def ensures_path(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-        return False
-    return True
+# def get_model(name, image_size, classes, equalize_embedding=True):
+#     name = name.lower()
+#     if name == 'alexnet':
+#         model = AlexNet(image_size[0])
+#         # return AlexNet(input_channels), AlexNetClassifier(classes)
+#     # elif 'resnet' in name:
+#     #     if name == 'resnet20':
+#     #         model
+#     #         return resnet20(None), ResnetClassifier(classes)
+#     #     else:
+#     #         assert False
+#     else:
+#         assert False
+#
+#     classifiers = get_intermediate_classifiers(model,
+#                                                image_size,
+#                                                classes,
+#                                                equalize_embedding=equalize_embedding)
+#
+#     return model, classifiers
 
 
-parser = argparse.ArgumentParser(description='Process some integers.')
+def bernulli(cfg: DictConfig, logits_training: bool = False):
+    log = logging.getLogger(__name__)
+    log.info(OmegaConf.to_yaml(cfg))
 
-parser.add_argument('files', metavar='N', type=str, nargs='+',
-                    help='Paths of the yaml con figuration files')
+    model_cfg = cfg['model']
+    model_name = model_cfg['name']
 
-parser.add_argument('--device',
-                    required=False,
-                    default=None,
-                    type=int,
-                    help='')
+    dataset_cfg = cfg['dataset']
+    dataset_name = dataset_cfg['name']
+    augmented_dataset = dataset_cfg.get('augment', False)
 
-parser.add_argument('--plot', action='store_true')
+    experiment_cfg = cfg['experiment']
+    load, save, path, experiments = experiment_cfg.get('load', True), \
+                                    experiment_cfg.get('save', True), \
+                                    experiment_cfg.get('path', None), \
+                                    experiment_cfg.get('experiments', 1)
 
-args = parser.parse_args()
+    plot = experiment_cfg.get('plot', False)
 
-for experiment in args.files:
+    method_cfg = cfg['method']
+    # distance_regularization, distance_weight, similarity = method_cfg.get(
+    #     'distance_regularization', True), \
+    #                                                        method_cfg.get(
+    #                                                            'distance_weight',
+    #                                                            1), \
+    #                                                        method_cfg[
+    #                                                            'similarity']
+    # ensemble_dropout = method_cfg.get('ensemble_dropout', 0)
+    # anneal_dirichlet = method_cfg.get('anneal_dirichlet', True)
+    # test_samples = method_cfg.get('test_samples', 1)
 
-    with open(experiment, 'r') as stream:
-        experiment_config = yaml.safe_load(stream)
+    training_cfg = cfg['training']
+    epochs, batch_size, device = training_cfg['epochs'], \
+                                 training_cfg['batch_size'], \
+                                 training_cfg.get('device', 'cpu')
 
-    to_save = experiment_config.get('save', True)
-    to_load = experiment_config.get('load', True)
-
-    save_path = experiment_config['save_path']
-    experiment_path = str(experiment_config['name'])
-
-    ensures_path(save_path)
-
-    with open(experiment_config['optimizer'], 'r') as file:
-        optimizer_config = yaml.safe_load(file)
-        optimizer_config = dict(optimizer_config)
-
-    optimizer, regularization, scheduler = get_optimizer(**optimizer_config)
-
-    if args.device is not None:
-        device = args.device
-    else:
-        device = experiment_config.get('device', 'cpu')
+    optimizer_cfg = cfg['optimizer']
+    optimizer, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
+                                                              'sgd'), \
+                                            optimizer_cfg.get('lr', 1e-1), \
+                                            optimizer_cfg.get('momentum', 0.9), \
+                                            optimizer_cfg.get('weight_decay', 0)
 
     if torch.cuda.is_available() and device != 'cpu':
         torch.cuda.set_device(device)
         device = 'cuda:{}'.format(device)
+    else:
+        warnings.warn("Device not found or CUDA not available.")
+
     device = torch.device(device)
 
-    with open(experiment_config['trainer'], 'r') as file:
-        trainer = yaml.safe_load(file)
-        trainer = dict(trainer)
-    eval_percentage = trainer.get('eval', None)
+    if not isinstance(experiments, int):
+        raise ValueError('experiments argument must be integer: {} given.'
+                         .format(experiments))
 
-    if 'early_stopping' in trainer:
-        early_stopping_dict = dict(trainer['early_stopping'])
-        early_stopping_value = early_stopping_dict.get('value', 'loss')
-        assert early_stopping_value in ['eval', 'loss']
-        if early_stopping_value == 'eval':
-            assert eval_percentage is not None and eval_percentage > 0
-        early_stopping = EarlyStopping(
-            tolerance=early_stopping_dict['tolerance'],
-            min=early_stopping_value == 'loss')
+    if path is None:
+        path = os.getcwd()
     else:
-        early_stopping = None
-        early_stopping_value = None
-
-    batch_size = trainer['batch_size']
-    epochs = trainer['epochs']
-    experiments = trainer.get('experiments', 1)
-
-    train, test, eval, input_size, classes = get_dataset(trainer['dataset'],
-                                                         model_name=trainer[
-                                                             'model'],
-                                                         augment=False)
-
-    train_loader = torch.utils.data.DataLoader(dataset=train,
-                                               batch_size=batch_size,
-                                               shuffle=True,
-                                               pin_memory=True, num_workers=4)
-    test_loader = torch.utils.data.DataLoader(dataset=test,
-                                              batch_size=batch_size,
-                                              shuffle=False,
-                                              pin_memory=True, num_workers=4)
-    eval_loader = None
-
-    for experiment_seed in range(experiments):
-        np.random.seed(experiment_seed)
-        torch.random.manual_seed(experiment_seed)
-
-        seed_path = os.path.join(save_path, experiment_path,
-                                 str(experiment_seed))
-
-        already_present = ensures_path(seed_path)
-
-        hs = [
-            logging.StreamHandler(sys.stdout),
-            # logging.StreamHandler(sys.stderr)
-        ]
-
-        hs.append(
-            logging.FileHandler(os.path.join(seed_path, 'info.log'), mode='w'))
-
-        logging.basicConfig(force=True, level=logging.INFO,
-                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                            handlers=hs
-                            )
-
-        logger = logging.getLogger(__name__)
-
-        config_info = experiment_config.copy()
-        config_info.update({'optimizer': optimizer_config, 'trainer': trainer})
-
-        logger.info('Config file \n{}'.format(
-            yaml.dump(config_info, allow_unicode=True,
-                      default_flow_style=False)))
-
-        logger.info('Experiment {}/{}'.format(experiment_seed + 1, experiments))
-
-        eval_loader = None
-        if eval is not None:
-            eval_loader = torch.utils.data.DataLoader(dataset=eval,
-                                                      batch_size=batch_size,
-                                                      shuffle=False)
-        elif eval_percentage is not None and eval_percentage > 0:
-            assert eval_percentage < 1
-            train_len = len(train)
-            eval_len = int(train_len * eval_percentage)
-            train_len = train_len - eval_len
-
-            train, eval = torch.utils.data.random_split(train,
-                                                        [train_len, eval_len])
-            train_loader = torch.utils.data.DataLoader(dataset=train,
-                                                       batch_size=batch_size,
-                                                       shuffle=True)
-            eval_loader = torch.utils.data.DataLoader(
-                dataset=eval,
-                batch_size=batch_size,
-                shuffle=False)
-
-            logger.info('Train dataset size: {}'.format(len(train)))
-            logger.info('Test dataset size: {}'.format(len(test)))
-            logger.info(
-                'Eval dataset created, having size: {}'.format(len(eval)))
-
-        method_name = experiment_config.get('method', None).lower()
-
-        method_parameters = dict(experiment_config.get('method_parameters', {}))
-
-        model = get_model(name=trainer['model'], input_size=input_size,
-                          output=classes)
-        model.to(device)
-
-        predictors = None
-        binaries = None
-
-        if experiment_config.get('fine_tuning', False):
-
-            ensures_path('results/models')
-
-            p = os.path.join('results/models',
-                             '{}_{}.pt'.format(trainer['model'].lower(),
-                                               experiment_seed))
-
-            if to_load and os.path.exists(p):
-                logger.info('Base model loaded.')
-
-                model_state_dict = torch.load(p, map_location=device)
-                model.load_state_dict(model_state_dict)
-
-            else:
-                logger.info('Base model training.')
-
-                with open(experiment_config['fine_tuning_trainer'],
-                          'r') as file:
-                    fine_tune_trainer = yaml.safe_load(file)
-
-                with open(experiment_config['fine_tuning_optimizer'],
-                          'r') as file:
-                    fine_tune_optimizer_config = yaml.safe_load(file)
-
-                optimizer, regularization, scheduler = get_optimizer(
-                    **fine_tune_optimizer_config)
-
-                opt = optimizer(model.parameters())
-
-                best_base_model, _, _, _ = standard_trainer(model=model,
-                                                            optimizer=opt,
-                                                            train_loader=train_loader,
-                                                            epochs=
-                                                            fine_tune_trainer[
-                                                                'epochs'],
-                                                            scheduler=None,
-                                                            early_stopping=early_stopping,
-                                                            test_loader=test_loader,
-                                                            eval_loader=eval_loader,
-                                                            device=device)
-                model.load_state_dict(best_base_model)
-                torch.save(best_base_model, p)
-
-            s = standard_eval(model, test_loader, topk=[1, 5],
-                              device=device)
-            logger.info('Base model scores: {}'.format(s))
-
-        if method_name == 'joint' or method_name == 'combined_output':
-            predictors = nn.ModuleList()
-
-            x, y = next(iter(train_loader))
-            _, outputs = model(x.to(device))
-
-            for o in outputs:
-                inc = o.shape[1]
-                bf = torch.flatten(o, 1)
-                cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
-                f = torch.flatten(cv(o), 1)
-
-                predictors.append(
-                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                  nn.Flatten(),
-                                  nn.Linear(f.shape[-1], classes)))
-
-            predictors.to(device)
-
-            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
-                # model_state_dict = torch.load(seed_path)
-                # model.load_state_dict(model_state_dict)
-
-                logger.info('Model loaded.')
-
-                md = torch.load(os.path.join(seed_path, 'model.pt'),
-                                map_location=device)
-                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
-                                map_location=device)
-
-                model.load_state_dict(md)
-                predictors.load_state_dict(pd)
-
-            else:
-
-                opt = optimizer(chain(model.parameters(),
-                                      predictors.parameters()))
-
-                if method_name == 'joint':
-                    (best_model, best_predictors), _, _, _ = joint_trainer(
-                        model=model,
-                        predictors=predictors,
-                        optimizer=opt,
-                        train_loader=train_loader,
-                        epochs=epochs,
-                        scheduler=None,
-                        early_stopping=early_stopping,
-                        test_loader=test_loader,
-                        eval_loader=eval_loader,
-                        device=device)
-                elif method_name == 'combined_output':
-                    weights = experiment_config.get('weights')
-                    convex_combination = experiment_config. \
-                        get('convex_combination', False)
-
-                    (best_model, best_predictors), _, _, _ = \
-                        output_combiner_trainer(
-                            model=model,
-                            predictors=predictors,
-                            optimizer=opt,
-                            train_loader=train_loader,
-                            epochs=epochs,
-                            scheduler=None,
-                            early_stopping=early_stopping,
-                            weights=weights,
-                            convex_combination=convex_combination,
-                            test_loader=test_loader,
-                            eval_loader=eval_loader,
-                            device=device)
-                else:
-                    assert False
-
-                model.load_state_dict(best_model)
-                predictors.load_state_dict(best_predictors)
-
-                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
-                torch.save(best_predictors,
-                           os.path.join(seed_path, 'predictors.pt'))
-
-        elif method_name == 'binary':
-            predictors = nn.ModuleList()
-            binaries = nn.ModuleList()
-
-            x, y = next(iter(train_loader))
-            _, outputs = model(x.to(device))
-
-            for o in outputs:
-                inc = o.shape[1]
-                bf = torch.flatten(o, 1)
-
-                cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
-                cv1 = nn.MaxPool2d(kernel_size=2).to(device)
-                f = torch.flatten(cv1(cv(o)), 1)
-
-                predictors.append(
-                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                  nn.ReLU(),
-                                  nn.MaxPool2d(kernel_size=2),
-                                  nn.Dropout(0.25),
-                                  nn.Flatten(),
-                                  nn.Linear(f.shape[-1], classes)))
-
-                binaries.append(
-                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                  nn.ReLU(),
-                                  nn.MaxPool2d(kernel_size=2),
-                                  nn.Dropout(0.25),
-                                  nn.Flatten(),
-                                  nn.Linear(f.shape[-1], 1),
-                                  nn.Sigmoid()))
-
-                torch.nn.init.constant_(binaries[-1][-2].bias, -10.0)
-
-            predictors.to(device)
-            binaries.to(device)
-
-            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
-                # model_state_dict = torch.load(seed_path)
-                # model.load_state_dict(model_state_dict)
-                logger.info('Model loaded.')
-
-                md = torch.load(os.path.join(seed_path, 'model.pt'),
-                                map_location=device)
-                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
-                                map_location=device)
-                bd = torch.load(os.path.join(seed_path,
-                                             'binary_classifiers.pt'),
-                                map_location=device)
-
-                model.load_state_dict(md)
-                predictors.load_state_dict(pd)
-                binaries.load_state_dict(bd)
-            else:
-
-                opt = optimizer(chain(model.parameters(),
-                                      predictors.parameters(),
-                                      binaries.parameters()))
-
-                # if method_name == 'joint':
-
-                (best_model, best_predictors,
-                 best_binaries), _, _, _ = binary_classifier_trainer(
-                    model=model,
-                    predictors=predictors,
-                    binary_classifiers=binaries,
-                    optimizer=opt,
-                    train_loader=train_loader,
-                    epochs=epochs,
-                    scheduler=None,
-                    energy_w=experiment_config.get('energy_w', 1e-3),
-                    # early_stopping=None,
-                    early_stopping=early_stopping,
-                    test_loader=test_loader,
-                    eval_loader=eval_loader,
-                    device=device)
-
-                # elif method_name == 'combined_output':
-                #     weights = experiment_config.get('weights')
-                #     convex_combination = experiment_config. \
-                #         get('convex_combination', False)
-                #
-                #     (best_model, best_predictors), _, _, _ = \
-                #         output_combiner_trainer(
-                #             model=model,
-                #             predictors=predictors,
-                #             optimizer=opt,
-                #             train_loader=train_loader,
-                #             epochs=epochs,
-                #             scheduler=None,
-                #             early_stopping=None,
-                #             weights=weights,
-                #             convex_combination=convex_combination,
-                #             test_loader=test_loader,
-                #             eval_loader=eval_loader,
-                #             device=device)
-                # else:
-                #     assert False
-
-                model.load_state_dict(best_model)
-                predictors.load_state_dict(best_predictors)
-                binaries.load_state_dict(best_binaries)
-
-                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
-                torch.save(best_predictors,
-                           os.path.join(seed_path, 'predictors.pt'))
-                torch.save(best_binaries,
-                           os.path.join(seed_path, 'binary_classifiers.pt'))
-
-        elif method_name == 'bayesian_joint':
-            # predictors = nn.ModuleList()
-            # predictors.to(device)
-
-            x, y = next(iter(train_loader))
-            _, outputs = model(x.to(device))
-
-            heads = []
-
-            for o in outputs:
-                h = BayesianHead(o, classes, device)
-                heads.append(h)
-
-            predictors = BayesianHeads(heads)
-
-            predictors.to(device)
-
-            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
-                # model_state_dict = torch.load(seed_path)
-                # model.load_state_dict(model_state_dict)
-                logger.info('Model loaded.')
-
-                md = torch.load(os.path.join(seed_path, 'model.pt'),
-                                map_location=device)
-                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
-                                map_location=device)
-
-                model.load_state_dict(md)
-                predictors.load_state_dict(pd)
-
-            else:
-
-                # opt = optimizer(chain(model.parameters(),
-                #                       predictors.parameters()))
-                opt = optimizer(chain(predictors.parameters()))
-
-                if method_name == 'bayesian_joint':
-                    (best_model,
-                     best_predictors), _, _, _ = bayesian_joint_trainer(
-                        model=model,
-                        predictors=predictors,
-                        optimizer=opt,
-                        train_loader=train_loader,
-                        epochs=epochs,
-                        scheduler=None,
-                        early_stopping=None,
-                        samples=experiment_config.get('train_samples', 1),
-                        test_loader=test_loader,
-                        eval_loader=eval_loader,
-                        prior_w=experiment_config.get('prior_w', 1),
-                        device=device)
-
-                # elif method_name == 'combined_output':
-                #     weights = experiment_config.get('weights')
-                #     convex_combination = experiment_config. \
-                #         get('convex_combination', False)
-                #
-                #     (best_model, best_predictors), _, _, _ = \
-                #         output_combiner_trainer(
-                #             model=model,
-                #             predictors=predictors,
-                #             optimizer=opt,
-                #             train_loader=train_loader,
-                #             epochs=epochs,
-                #             scheduler=None,
-                #             early_stopping=None,
-                #             weights=weights,
-                #             convex_combination=convex_combination,
-                #             test_loader=test_loader,
-                #             eval_loader=eval_loader,
-                #             device=device)
-                else:
-                    assert False
-
-                model.load_state_dict(best_model)
-                predictors.load_state_dict(best_predictors)
-
-                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
-                torch.save(best_predictors,
-                           os.path.join(seed_path, 'predictors.pt'))
-
-        elif method_name == 'stick_breaking':
-
-            predictors = nn.ModuleList()
-
-            x, y = next(iter(train_loader))
-            _, outputs = model(x.to(device))
-
-            mx = experiment_config.get('max_clamp', 10)
-            mn = experiment_config.get('min_clamp', 0.1)
-
-            a = experiment_config.get('constant_a', None)
-            if a is not None:
-                alphas = a
-            else:
-                alphas = nn.ModuleList()
-
-            b = experiment_config.get('constant_b', None)
-            if b is not None:
-                betas = b
-            else:
-                betas = nn.ModuleList()
-
-            for o in outputs:
-                inc = o.shape[1]
-                bf = torch.flatten(o, 1)
-
-                cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
-                cv1 = nn.MaxPool2d(kernel_size=2).to(device)
-                f = torch.flatten(cv1(cv(o)), 1)
-
-                if a is None:
-                    alphas.append(
-                        nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                      nn.ReLU(),
-                                      nn.MaxPool2d(kernel_size=2),
-                                      nn.Dropout(0.25),
-                                      nn.Flatten(),
-                                      nn.Linear(f.shape[-1], 1),
-                                      nn.Hardtanh(min_val=mn, max_val=mx)))
-                if b is None:
-                    betas.append(
-                        nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                      nn.ReLU(),
-                                      nn.MaxPool2d(kernel_size=2),
-                                      nn.Dropout(0.25),
-                                      nn.Flatten(),
-                                      nn.Linear(f.shape[-1], 1),
-                                      nn.Hardtanh(min_val=mn, max_val=mx)))
-
-                predictors.append(
-                    nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                                  nn.ReLU(),
-                                  nn.MaxPool2d(kernel_size=2),
-                                  nn.Dropout(0.25),
-                                  nn.Flatten(),
-                                  nn.Linear(f.shape[-1], classes)))
-
-                # binaries.append(
-                #     nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-                #                   nn.ReLU(),
-                #                   nn.MaxPool2d(kernel_size=2),
-                #                   nn.Dropout(0.25),
-                #                   nn.Flatten(),
-                #                   nn.Linear(f.shape[-1], 1),
-                #                   nn.Sigmoid()))
-
-                # torch.nn.init.constant_(betas[-1][-2].bias, 5.0)
-                torch.nn.init.constant_(betas[-1][-2].bias, 5.0)
-
-            posteriors = LayerEmbeddingBeta(beta_layers=betas,
-                                            alpha_layers=alphas,
-                                            max_clamp=experiment_config.
-                                            get('max_clamp', None),
-                                            min_clamp=experiment_config.
-                                            get('min_clamp', None))
-
-            posteriors.to(device)
-            predictors.to(device)
-
-            # opt = Adam(chain(model.parameters(),
-            #                  predictors.parameters(),
-            #                  posteriors.parameters()),
-            #            lr=0.001, weight_decay=1e-6)
-
-            if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
-                # model_state_dict = torch.load(seed_path)
-                # model.load_state_dict(model_state_dict)
-                logger.info('Model loaded.')
-
-                md = torch.load(os.path.join(seed_path, 'model.pt'),
-                                map_location=device)
-                pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
-                                map_location=device)
-                dd = torch.load(os.path.join(seed_path, 'posteriors.pt'),
-                                map_location=device)
-
-                model.load_state_dict(md)
-                posteriors.load_state_dict(pd)
-                posteriors.load_state_dict(dd)
-
-            else:
-
-                opt = optimizer(chain(model.parameters(),
-                                      predictors.parameters(),
-                                      posteriors.parameters()))
-
-                # for n, m in chain(model.named_parameters(),
-                #                   predictors.named_parameters(),
-                #                   posteriors.named_parameters()):
-                #     print(n, m.requires_grad)
-                #
-                # input()
-
-                (best_model, best_predictors, best_binaries) = \
-                    branching_trainer(model,
-                                      predictors,
-                                      posteriors,
-                                      one_hot=experiment_config.get('one_hot',
-                                                                    False),
-                                      energy_reg=experiment_config.get(
-                                          'energy_reg', 1e-3),
-                                      optimizer=opt,
-                                      train_loader=train_loader,
-                                      epochs=epochs,
-                                      scheduler=None,
-                                      early_stopping=None,
-                                      test_loader=test_loader,
-                                      eval_loader=eval_loader,
-                                      device=device,
-                                      samples=experiment_config.get('samples',
-                                                                    1))[
-                        0]
-
-                model.load_state_dict(best_model)
-                predictors.load_state_dict(best_predictors)
-                posteriors.load_state_dict(best_binaries)
-
-                torch.save(best_model, os.path.join(seed_path, 'model.pt'))
-                torch.save(best_predictors,
-                           os.path.join(seed_path, 'predictors.pt'))
-                torch.save(best_binaries,
-                           os.path.join(seed_path, 'posteriors.pt'))
-
-        # elif method_name == 'bayesian_binary':
-        #     predictors = nn.ModuleList()
-        #     binaries = nn.ModuleList()
-        #
-        #     x, y = next(iter(train_loader))
-        #     _, outputs = model(x.to(device))
-        #
-        #     for o in outputs:
-        #         inc = o.shape[1]
-        #         bf = torch.flatten(o, 1)
-        #         cv = nn.Conv2d(inc, 128, kernel_size=3).to(device)
-        #         f = torch.flatten(cv(o), 1)
-        #
-        #         predictors.append(
-        #             nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-        #                           nn.Flatten(),
-        #                           nn.Linear(f.shape[-1], classes)))
-        #         binaries.append(
-        #             nn.Sequential(nn.Conv2d(inc, 128, kernel_size=3),
-        #                           nn.Flatten(),
-        #                           nn.Linear(f.shape[-1], 1),
-        #                           nn.Sigmoid()))
-        #
-        #     posteriors = LayerEmbeddingContBernoulli(alpha_layers=binaries)
-        #
-        #     predictors.to(device)
-        #     posteriors.to(device)
-        #
-        #     if to_load and os.path.exists(os.path.join(seed_path, 'model.pt')):
-        #         # model_state_dict = torch.load(seed_path)
-        #         # model.load_state_dict(model_state_dict)
-        #
-        #         md = torch.load(os.path.join(seed_path, 'model.pt'),
-        #                         map_location=device)
-        #         pd = torch.load(os.path.join(seed_path, 'predictors.pt'),
-        #                         map_location=device)
-        #         bd = torch.load(os.path.join(seed_path,
-        #                                      'posteriors.pt'),
-        #                         map_location=device)
-        #
-        #         model.load_state_dict(md)
-        #         predictors.load_state_dict(pd)
-        #         posteriors.load_state_dict(bd)
-        #     else:
-        #
-        #         opt = optimizer(chain(model.parameters(),
-        #                               predictors.parameters(),
-        #                               posteriors.parameters()))
-        #
-        #         prior = ContinuousBernoulli(torch.tensor([0.2], device=device))
-        #
-        #         # if method_name == 'joint':
-        #         (best_model, best_predictors,
-        #          best_binaries), _, _, _ = posterior_classifier_trainer(
-        #             model=model,
-        #             predictors=predictors,
-        #             posteriors=posteriors,
-        #             optimizer=opt,
-        #             prior=prior,
-        #             prior_w=experiment_config.get('prior_w', 0.1),
-        #             entropy_w=experiment_config.get('entropy_w', 1),
-        #             train_loader=train_loader,
-        #             epochs=epochs,
-        #             use_mmd=experiment_config.get('mmd', False),
-        #             scheduler=None,
-        #             early_stopping=early_stopping,
-        #             test_loader=test_loader,
-        #             eval_loader=eval_loader,
-        #             device=device,
-        #             cumulative_prior=False)
-        #
-        #         # elif method_name == 'combined_output':
-        #         #     weights = experiment_config.get('weights')
-        #         #     convex_combination = experiment_config. \
-        #         #         get('convex_combination', False)
-        #         #
-        #         #     (best_model, best_predictors), _, _, _ = \
-        #         #         output_combiner_trainer(
-        #         #             model=model,
-        #         #             predictors=predictors,
-        #         #             optimizer=opt,
-        #         #             train_loader=train_loader,
-        #         #             epochs=epochs,
-        #         #             scheduler=None,
-        #         #             early_stopping=None,
-        #         #             weights=weights,
-        #         #             convex_combination=convex_combination,
-        #         #             test_loader=test_loader,
-        #         #             eval_loader=eval_loader,
-        #         #             device=device)
-        #         # else:
-        #         #     assert False
-        #
-        #         model.load_state_dict(best_model)
-        #         predictors.load_state_dict(best_predictors)
-        #         posteriors.load_state_dict(best_binaries)
-        #
-        #         torch.save(best_model, os.path.join(seed_path, 'model.pt'))
-        #         torch.save(best_predictors,
-        #                    os.path.join(seed_path, 'predictors.pt'))
-        #         torch.save(best_binaries,
-        #                    os.path.join(seed_path, 'posteriors.pt'))
+        os.chdir(path)
+        os.makedirs(path, exist_ok=True)
+
+    for i in range(experiments):
+        log.info('Experiment #{}'.format(i))
+
+        torch.manual_seed(i)
+        np.random.seed(i)
+
+        experiment_path = os.path.join(path, 'exp_{}'.format(i))
+        os.makedirs(experiment_path, exist_ok=True)
+
+        train_set, test_set, input_size, classes = \
+            get_dataset(name=dataset_name,
+                        model_name=None,
+                        augmentation=augmented_dataset)
+
+        trainloader = torch.utils.data.DataLoader(train_set,
+                                                  batch_size=batch_size,
+                                                  shuffle=True)
+
+        testloader = torch.utils.data.DataLoader(test_set,
+                                                 batch_size=batch_size,
+                                                 shuffle=False)
+
+        backbone, classifiers = get_model(model_name,
+                                          image_size=input_size,
+                                          classes=classes,
+                                          get_binaries=True)
+
+        if os.path.exists(os.path.join(experiment_path, 'bb.pt')):
+            backbone.load_state_dict(torch.load(
+                os.path.join(experiment_path, 'bb.pt')))
+            classifiers.load_state_dict(torch.load(
+                os.path.join(experiment_path, 'classifiers.pt')))
         else:
-            assert False, 'Accepted methods: joint, combined_output, binary'
+            log.info('Training started.')
 
-        sample_image = next(iter(train_loader))[0][1:2].to(device)
-        costs = branches_predictions(model, predictors, sample_image)
+            # optimizer = optim.SGD(chain(backbone1.parameters(),
+            #                             backbone2.parameters(),
+            #                             backbone3.parameters(),
+            #                             classifier.parameters()), lr=0.01,
+            #                       momentum=0.9)
 
-        torch.save(costs, os.path.join(seed_path, 'costs.res'))
+            parameters = chain(backbone.parameters(),
+                               classifiers.parameters())
 
-        if method_name in ['joint',
-                           'combined_output',
-                           'binary',
-                           'bayesian_joint',
-                           'bayesian_binary',
-                           'stick_breaking']:
+            optimizer = get_optimizer(parameters=parameters, name=optimizer,
+                                      lr=lr,
+                                      momentum=momentum,
+                                      weight_decay=weight_decay)
 
-            s = branches_eval(model, predictors, test_loader, device=device)
-            logger.info('Branches scores {}'.format(s))
-            """
-            logger.info('Percentile entropy experiment')
+            backbone, classifiers = binary_bernulli_trainer(model=backbone,
+                                                            predictors=classifiers,
+                                                            bernulli_models=classifiers,
+                                                            optimizer=optimizer,
+                                                            train_loader=trainloader,
+                                                            epochs=epochs,
+                                                            prior_parameters=[
+                                                                0.1, 0.2, 0.3,
+                                                                0.4, 0.6][::-1],
+                                                            # prior_w=prior_w,
+                                                            # cost_reg=1e-3,
+                                                            # use_mmd=False,
+                                                            # scheduler=None,
+                                                            # early_stopping=None,
+                                                            test_loader=testloader,
+                                                            # eval_loader=,
+                                                            # cumulative_prior=False,
+                                                            device=device)[:2]
 
-            ps = experiment_config.get('entropy_threshold',
-                                       [0.1, 0.15,
-                                        0.20, 0.25,
-                                        0.30, 0.5, 0.75])
-            if isinstance(ps, float):
-                ps = [ps]
-
-            for p in ps:
-                s, c = eval_branches_entropy(model,
-                                             predictors,
-                                             percentile=p,
-                                             dataset_loader=test_loader,
-                                             eval_loader=eval_loader,
-                                             device=device,
-                                             samples=experiment_config.
-                                             get('test_samples', 1))
-
-                logger.info('Percentile: {}'.format(p))
-                logger.info('\tScores: {}'.format(s))
-                logger.info('\tCounters: {}'.format(c))"""
-
-            entropy_results = {}
-
-            logger.info('Branches entropy experiment')
-            th = experiment_config.get('entropy_threshold',
-                                       [0.001, 0.01,
-                                        0.05, 0.1,
-                                        0.25, 0.5, 0.75])
-            if isinstance(th, float):
-                th = [th]
-
-            for h in th:
-                s, c = branches_entropy(model=model,
-                                        threshold=h,
-                                        dataset_loader=test_loader,
-                                        predictors=predictors,
-                                        device=device,
-                                        samples=
-                                        experiment_config.get('test_samples',
-                                                              1))
-
-                entropy_results[h] = {'counters': c, 'scores': s}
-
-                logger.info('Threshold: {}'.format(h))
-                logger.info('\tCumulative score: {}'.format(s['global']))
-                logger.info('\tScores: {}'.format(s))
-                logger.info('\tCounters: {}'.format(c))
-
-                torch.save(entropy_results, os.path.join(seed_path,
-                                                         'entropy.res'))
-
-        if method_name == 'binary' or method_name == 'bayesian_binary' or \
-                method_name == 'stick_breaking':
-            th = experiment_config.get('binary_threshold', 0.5)
-
-            # s = branches_eval(model, predictors, test_loader, device=device)
-            # logger.info('Branches scores {}'.format(s))
-
-            logger.info('Branches binary experiment')
-            s, c = branches_binary(model=model,
-                                   binary_classifiers=binaries,
-                                   dataset_loader=test_loader,
-                                   predictors=predictors,
-                                   threshold=th,
-                                   device=device)
-
-            logger.info('\tScores: {}'.format(s))
-            logger.info('\tCounters: {}'.format(c))
-
-        if args.plot:
-            figures = plot_branches_entropy(model=model,
-                                            predictors=predictors,
-                                            dataset=test_loader,
-                                            device=device,
-                                            samples=experiment_config.
-                                            get('test_samples', 1))
-
-            for i, f in enumerate(figures):
-                f.savefig(os.path.join(seed_path, 'b{}_entropy.pdf'.format(i)))
-
-            if method_name == 'binary' or method_name == 'bayesian_binary':
-                figures = plot_branches_binary(model,
-                                               binary_classifiers=binaries,
-                                               dataset=test_loader,
-                                               predictors=predictors,
-                                               device=device,
-                                               samples=1)
-
-                for i, f in enumerate(figures):
-                    f.savefig(
-                        os.path.join(seed_path, 'b{}_binary.pdf'.format(i)))
-
-        # if method_name is None or method_name == 'normal':
-        #     method_name = 'normal'
-        #     method = SingleModel(model=model, device=device)
-        # elif method_name == 'naive':
-        #     method = Naive(model=model, device=device,
-        #                    method_parameters=method_parameters)
-        # elif method_name == 'supermask':
-        #     method = SuperMask(model=model, method_parameters=method_parameters,
-        #                        device=device)
-        # elif method_name == 'batch_ensemble':
-        #     method = BatchEnsemble(model=model,
-        #                            method_parameters=method_parameters,
-        #                            device=device)
-        # elif method_name == 'batch_supermask':
-        #     method = ExtremeBatchPruningSuperMask(model=model,
-        #                                           method_parameters=method_parameters,
-        #                                           device=device)
-        # elif method_name == 'mc_dropout':
-        #     method = MCDropout(model=model, method_parameters=method_parameters,
-        #                        device=device)
-        # elif method_name == 'snapshot':
-        #     method = Snapshot(model=model, method_parameters=method_parameters,
-        #                       device=device)
+        #     if logits_training:
+        #         backbone, classifiers = dirichlet_logits_model_train(
+        #             backbone=backbone,
+        #             classifiers=classifiers,
+        #             trainloader=trainloader,
+        #             testloader=testloader,
+        #             optimizer=optimizer,
+        #             distance_regularization=distance_regularization,
+        #             distance_weight=distance_weight,
+        #             similarity=similarity,
+        #             epochs=epochs,
+        #             anneal_dirichlet=anneal_dirichlet,
+        #             ensemble_dropout=ensemble_dropout,
+        #             test_samples=test_samples,
+        #             device=device)
+        #     else:
+        #         backbone, classifiers = dirichlet_model_train(
+        #             backbone=backbone,
+        #             classifiers=classifiers,
+        #             trainloader=trainloader,
+        #             testloader=testloader,
+        #             optimizer=optimizer,
+        #             distance_regularization=distance_regularization,
+        #             distance_weight=distance_weight,
+        #             similarity=similarity,
+        #             epochs=epochs,
+        #             anneal_dirichlet=anneal_dirichlet,
+        #             ensemble_dropout=ensemble_dropout,
+        #             test_samples=test_samples,
+        #             device=device)
+        #
+        #     # criterion=criterion,
+        #     # past_models=past_models,
+        #     # distance_regularization=distance_regularization,
+        #     # distance_weight=distance_weight,
+        #     # cosine_distance=cosine_distance,
+        #     # mode_connectivity=mode_connectivity,
+        #     # connect_to_last=connect_to_last)
+        #
+            torch.save(backbone.state_dict(), os.path.join(experiment_path,
+                                                           'bb.pt'))
+            torch.save(classifiers.state_dict(), os.path.join(experiment_path,
+                                                              'classifiers.pt'))
+        # log.info('Evaluation process')
+        #
+        # ff = BranchExit(model=backbone,
+        #                 classifiers=classifiers,
+        #                 exit_to_use=-1,
+        #                 use_last_classifier=not logits_training)
+        #
+        # for i in range(backbone.n_branches()):
+        #     ff.exit_to_use = i
+        #     score = accuracy_score(testloader, ff, device)[0]
+        #
+        #     # score, _, _ = exit_evaluator(backbone=backbone,
+        #     #                              classifiers=classifiers,
+        #     #                              dataloader=testloader,
+        #     #                              exit_to_use=i,
+        #     #                              use_last_classifier=not logits_training,
+        #     #                              device=device)
+        #
+        #     log.info('Score obtained using exit #{}: {}'.format(i + 1,
+        #                                                         score))
+        #
+        # # score, total, correct = dirichlet_evaluator(backbone=backbone,
+        # #                                             # backbone2=backbone2,
+        # #                                             # backbone3=backbone3,
+        # #                                             classifiers=classifiers,
+        # #                                             dataloader=testloader,
+        # #                                             test_samples=test_samples,
+        # #                                             combine_logits=logits_training,
+        # #                                             device=device)
+        #
+        # if logits_training:
+        #     ff = DirichletLogits(model=backbone,
+        #                          classifiers=classifiers,
+        #                          samples=test_samples)
         # else:
-        #     assert False
+        #     ff = DirichletEmbeddings(model=backbone,
+        #                              classifiers=classifiers,
+        #                              samples=test_samples)
+        #
+        # one_pixel_attack(testloader, ff, device)
+        #
+        # score = accuracy_score(testloader, ff, device)[0]
+        #
+        # log.info('Dirichlet score: {}'.format(score))
+        #
+        # # ground_truth, predicted_labels, probs = dirichlet_forward(
+        # #     backbone=backbone,
+        # #     # backbone2=backbone2,
+        # #     # backbone3=backbone3,
+        # #     classifiers=classifiers,
+        # #     dataloader=testloader,
+        # #     test_samples=test_samples,
+        # #     combine_logits=logits_training,
+        # #     device=device)
+        #
+        # # ground_truth, predicted_labels, probs = \
+        # #     get_probabilities(testloader, ff, device)
+        #
+        # ece, _, _, _ = ece_score(testloader, ff, device)
+        # log.info('ECE score: {}'.format(ece))
+        #
+        # # ff = DirichletLogits(model=backbone,
+        # #                      classifiers=classifiers,
+        # #                      samples=test_samples)
+        # # score = accuracy_score(testloader, ff, device)[0]
+        # # input(score)
+        # # score, total, correct = dirichlet_evaluator(backbone1=backbone1,
+        # #                                             backbone2=backbone2,
+        # #                                             backbone3=backbone3,
+        # #                                             classifier=classifier,
+        # #                                             dataloader=testloader,
+        # #                                             device=device)
+        # #
+        # # log.info('Dirichlet score: {}'.format(score))
+        # #
+        # # if plot:
+        # #     log.info('Plotting.')
+        # #     images_path = os.path.join(experiment_path, 'images')
+        # #     os.makedirs(images_path, exist_ok=True)
+        # #
+        # #     if not os.path.exists(
+        # #             os.path.join(images_path, "flatten_embs.pdf")):
+        # #         loss_figure, score_figure = flat_embedding_plots(backbone1,
+        # #                                                          backbone2,
+        # #                                                          backbone3,
+        # #                                                          classifier,
+        # #                                                          testloader,
+        # #                                                          device=device)
+        # #
+        # #         loss_figure.savefig(
+        # #             os.path.join(images_path, "flatten_embs.pdf"),
+        # #             bbox_inches='tight')
+        # #         plt.close(loss_figure)
+        # #
+        # #         score_figure.savefig(
+        # #             os.path.join(images_path, "flatten_embs_score.pdf"),
+        # #             bbox_inches='tight')
+        # #         plt.close(score_figure)
+        # #
+        # #     # if not os.path.exists(os.path.join(images_path, "weights_plot.pdf")):
+        # #     #     figure, figure_score = weights_plot(b1, b2, b3, classifier,
+        # #     #                                         testloader,
+        # #     #                                         criterion=criterion,
+        # #     #                                         device=device)
+        # #     #
+        # #     #     figure.savefig(os.path.join(images_path, "weights_plot.pdf"),
+        # #     #                    bbox_inches='tight')
+        # #     #     plt.close(figure)
+        # #     #
+        # #     #     figure_score.savefig(os.path.join(images_path, "weights_score.pdf"),
+        # #     #                          bbox_inches='tight')
+        # #     #     plt.close(figure_score)
+        # #     #
+        # #     # if not os.path.exists(
+        # #     #         os.path.join(images_path, "model_similarity.pdf")):
+        # #     #     figure = model_cosine_similarity_plot(b1, b2, b3, classifier,
+        # #     #                                           testloader,
+        # #     #                                           criterion=criterion,
+        # #     #                                           device=device)
+        # #     #
+        # #     #     figure.savefig(os.path.join(images_path, "model_similarity.pdf"),
+        # #     #                    bbox_inches='tight')
+        # #     #     plt.close(figure)
+        # #
+        # #     if not os.path.exists(
+        # #             os.path.join(images_path, "flatten_embs_similarity.pdf")):
+        # #         figure = flat_embedding_cosine_similarity_plot(backbone1,
+        # #                                                        backbone2,
+        # #                                                        backbone3,
+        # #                                                        classifier,
+        # #                                                        testloader,
+        # #                                                        device=device)
+        # #         figure.savefig(
+        # #             os.path.join(images_path, "flatten_embs_similarity.pdf"),
+        # #             bbox_inches='tight')
+        # #         plt.close(figure)
+        # #
+        # #     # if not os.path.exists(
+        # #     #         os.path.join(images_path, "logits_similarity.pdf")):
+        # #     #     figure = logits_cosine_similarity_plot(b1, b2, b3, classifier,
+        # #     #                                            testloader,
+        # #     #                                            criterion=criterion,
+        # #     #                                            device=device)
+        # #     #     figure.savefig(
+        # #     #         os.path.join(images_path, "logits_similarity.pdf"),
+        # #     #         bbox_inches='tight')
+        # #     #     plt.close(figure)
+        # #     #
+        # #     # if not os.path.exists(
+        # #     #         os.path.join(images_path, "similarity_0.pdf")):
+        # #     #
+        # #     #     figures = embedding_cosine_similarity_plot(b1, b2, b3,
+        # #     #                                                classifier,
+        # #     #                                                testloader,
+        # #     #                                                criterion=criterion,
+        # #     #                                                device=device)
+        # #     #
+        # #     #     for label, figure in figures:
+        # #     #         figure.savefig(
+        # #     #             os.path.join(images_path,
+        # #     #                          "similarity_{}.pdf".format(label)),
+        # #     #             bbox_inches='tight')
+        # #     #         plt.close(figure)
+        # #     #
+        # #     # if not os.path.exists(
+        # #     #         os.path.join(images_path, "loss_space_class_0.pdf")):
+        # #     #
+        # #     #     figures = classes_embedding_plots(b1, b2, b3, classifier,
+        # #     #                                       testloader,
+        # #     #                                       criterion=criterion,
+        # #     #                                       device=device)
+        # #     #
+        # #     #     for label, figure in figures:
+        # #     #         figure.savefig(
+        # #     #             os.path.join(images_path,
+        # #     #                          "loss_space_class{}.pdf".format(label)),
+        # #     #             bbox_inches='tight')
+        # #     #         plt.close(figure)
+        #
+        # if plot:
+        #     log.info('Plotting.')
+        #     images_path = os.path.join(experiment_path, 'images')
+        #     os.makedirs(images_path, exist_ok=True)
+        #
+        #     if not os.path.exists(
+        #             os.path.join(images_path, "flatten_embs.pdf")):
+        #         loss_figure, score_figure = flat_embedding_plots(backbone,
+        #                                                          classifiers,
+        #                                                          testloader,
+        #                                                          device=device)
+        #
+        #         loss_figure.savefig(
+        #             os.path.join(images_path, "flatten_embs.pdf"),
+        #             bbox_inches='tight')
+        #         plt.close(loss_figure)
+        #
+        #         score_figure.savefig(
+        #             os.path.join(images_path, "flatten_embs_score.pdf"),
+        #             bbox_inches='tight')
+        #         plt.close(score_figure)
+        #
+        #     if logits_training:
+        #         loss_figure, score_figure = flat_logits_plots(backbone,
+        #                                                       classifiers,
+        #                                                       testloader,
+        #                                                       grid_points=100,
+        #                                                       plot_offsets=1,
+        #                                                       device=device)
+        #
+        #         loss_figure.savefig(
+        #             os.path.join(images_path, "flatten_logits.pdf"),
+        #             bbox_inches='tight')
+        #         plt.close(loss_figure)
+        #
+        #         score_figure.savefig(
+        #             os.path.join(images_path, "flatten_logits_score.pdf"),
+        #             bbox_inches='tight')
+        #         plt.close(score_figure)
+        #
+        #     # if not os.path.exists(os.path.join(images_path, "weights_plot.pdf")):
+        #     #     figure, figure_score = weights_plot(b1, b2, b3, classifier,
+        #     #                                         testloader,
+        #     #                                         criterion=criterion,
+        #     #                                         device=device)
+        #     #
+        #     #     figure.savefig(os.path.join(images_path, "weights_plot.pdf"),
+        #     #                    bbox_inches='tight')
+        #     #     plt.close(figure)
+        #     #
+        #     #     figure_score.savefig(os.path.join(images_path, "weights_score.pdf"),
+        #     #                          bbox_inches='tight')
+        #     #     plt.close(figure_score)
+        #     #
+        #     # if not os.path.exists(
+        #     #         os.path.join(images_path, "model_similarity.pdf")):
+        #     #     figure = model_cosine_similarity_plot(b1, b2, b3, classifier,
+        #     #                                           testloader,
+        #     #                                           criterion=criterion,
+        #     #                                           device=device)
+        #     #
+        #     #     figure.savefig(os.path.join(images_path, "model_similarity.pdf"),
+        #     #                    bbox_inches='tight')
+        #     #     plt.close(figure)
+        #
+        #     # if not os.path.exists(
+        #     #         os.path.join(images_path, "flatten_embs_similarity.pdf")):
+        #     #     figure = flat_embedding_cosine_similarity_plot(backbone1,
+        #     #                                                    backbone2,
+        #     #                                                    backbone3,
+        #     #                                                    classifier,
+        #     #                                                    testloader,
+        #     #                                                    device=device)
+        #     #     figure.savefig(
+        #     #         os.path.join(images_path, "flatten_embs_similarity.pdf"),
+        #     #         bbox_inches='tight')
+        #     #     plt.close(figure)
 
-        # logger.info('Method used: {}'.format(method_name))
+        log.info('#' * 100)
 
-        # if to_load and os.path.exists(os.path.join(seed_path, 'results.pkl')):
-        #     method.load(os.path.join(seed_path))
-        #     with open(os.path.join(seed_path, 'results.pkl'), 'rb') as file:
-        #         results = pickle.load(file)
-        #     logger.info('Results and models loaded.')
-        # else:
-        #     results = method.train_models(optimizer=optimizer,
-        #                                   train_dataset=train_loader,
-        #                                   epochs=epochs,
-        #                                   scheduler=scheduler,
-        #                                   early_stopping=early_stopping,
-        #                                   test_dataset=test_loader,
-        #                                   eval_dataset=eval_loader)
-        #
-        #     if to_save:
-        #         method.save(seed_path)
-        #         with open(os.path.join(seed_path, 'results.pkl'), 'wb') as file:
-        #             pickle.dump(results, file, protocol=pickle.HIGHEST_PROTOCOL)
-        #         logger.info('Results and models saved.')
 
-        # logger.info('Ensemble '
-        #             'score on test: {}'.format(
-        #     eval_method(method, dataset=test_loader)[0]))
+# def joint(cfg: DictConfig):
+#     log = logging.getLogger(__name__)
+#     log.info(OmegaConf.to_yaml(cfg))
+#
+#     model_cfg = cfg['model']
+#     model_name = model_cfg['name']
+#
+#     dataset_cfg = cfg['dataset']
+#     dataset_name = dataset_cfg['name']
+#     augmented_dataset = dataset_cfg.get('augment', False)
+#
+#     experiment_cfg = cfg['experiment']
+#     load, save, path, experiments = experiment_cfg.get('load', True), \
+#                                     experiment_cfg.get('save', True), \
+#                                     experiment_cfg.get('path', None), \
+#                                     experiment_cfg.get('experiments', 1)
+#
+#     plot = experiment_cfg.get('plot', False)
+#
+#     method_cfg = cfg['method']
+#     weights = method_cfg.get('weights', None)
+#
+#     training_cfg = cfg['training']
+#     epochs, batch_size, device = training_cfg['epochs'], \
+#                                  training_cfg['batch_size'], \
+#                                  training_cfg.get('device', 'cpu')
+#
+#     optimizer_cfg = cfg['optimizer']
+#     optimizer, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
+#                                                               'sgd'), \
+#                                             optimizer_cfg.get('lr', 1e-1), \
+#                                             optimizer_cfg.get('momentum', 0.9), \
+#                                             optimizer_cfg.get('weight_decay', 0)
+#
+#     if torch.cuda.is_available() and device != 'cpu':
+#         torch.cuda.set_device(device)
+#         device = 'cuda:{}'.format(device)
+#     else:
+#         warnings.warn("Device not found or CUDA not available.")
+#
+#     device = torch.device(device)
+#
+#     if not isinstance(experiments, int):
+#         raise ValueError('experiments argument must be integer: {} given.'
+#                          .format(experiments))
+#
+#     if path is None:
+#         path = os.getcwd()
+#     else:
+#         os.chdir(path)
+#         os.makedirs(path, exist_ok=True)
+#
+#     for i in range(experiments):
+#         log.info('Experiment #{}'.format(i))
+#
+#         torch.manual_seed(i)
+#         np.random.seed(i)
+#
+#         experiment_path = os.path.join(path, 'exp_{}'.format(i))
+#         os.makedirs(experiment_path, exist_ok=True)
+#
+#         train_set, test_set, input_size, classes = \
+#             get_dataset(name=dataset_name,
+#                         model_name=None,
+#                         augmentation=augmented_dataset)
+#
+#         trainloader = torch.utils.data.DataLoader(train_set,
+#                                                   batch_size=batch_size,
+#                                                   shuffle=True)
+#
+#         testloader = torch.utils.data.DataLoader(test_set,
+#                                                  batch_size=batch_size,
+#                                                  shuffle=False)
+#
+#         backbone, classifiers = get_model(model_name,
+#                                           image_size=input_size,
+#                                           classes=classes)
+#
+#         if os.path.exists(os.path.join(experiment_path, 'bb.pt')):
+#             backbone.load_state_dict(torch.load(
+#                 os.path.join(experiment_path, 'bb.pt')))
+#             classifiers.load_state_dict(torch.load(
+#                 os.path.join(experiment_path, 'classifiers.pt')))
+#         else:
+#             log.info('Training started.')
+#
+#             # optimizer = optim.SGD(chain(backbone1.parameters(),
+#             #                             backbone2.parameters(),
+#             #                             backbone3.parameters(),
+#             #                             classifier.parameters()), lr=0.01,
+#             #                       momentum=0.9)
+#
+#             parameters = chain(backbone.parameters(),
+#                                classifiers.parameters())
+#
+#             optimizer = get_optimizer(parameters=parameters, name=optimizer,
+#                                       lr=lr,
+#                                       momentum=momentum,
+#                                       weight_decay=weight_decay)
+#
+#             backbone, classifiers = joint_train(
+#                 backbone=backbone,
+#                 classifiers=classifiers,
+#                 trainloader=trainloader,
+#                 testloader=testloader,
+#                 weights=weights,
+#                 optimizer=optimizer,
+#                 epochs=epochs,
+#                 device=device)
+#
+#             # criterion=criterion,
+#             # past_models=past_models,
+#             # distance_regularization=distance_regularization,
+#             # distance_weight=distance_weight,
+#             # cosine_distance=cosine_distance,
+#             # mode_connectivity=mode_connectivity,
+#             # connect_to_last=connect_to_last)
+#
+#             torch.save(backbone.state_dict(), os.path.join(experiment_path,
+#                                                            'bb.pt'))
+#             torch.save(classifiers.state_dict(), os.path.join(experiment_path,
+#                                                               'classifiers.pt'))
+#         log.info('Evaluation process')
+#
+#         for i in range(backbone.n_branches()):
+#             score, _, _ = exit_evaluator(backbone=backbone,
+#                                          classifiers=classifiers,
+#                                          dataloader=testloader,
+#                                          exit_to_use=i,
+#                                          use_last_classifier=False,
+#                                          device=device)
+#
+#             log.info('Score obtained using exit #{}: {}'.format(i + 1,
+#                                                                 score))
+#
+#         # score, total, correct = dirichlet_evaluator(backbone=backbone,
+#         #                                             # backbone2=backbone2,
+#         #                                             # backbone3=backbone3,
+#         #                                             classifiers=classifiers,
+#         #                                             dataloader=testloader,
+#         #                                             test_samples=test_samples,
+#         #                                             combine_logits=logits_training,
+#         #                                             device=device)
+#         # log.info('Dirichlet score: {}'.format(score))
+#
+#         # score, total, correct = dirichlet_evaluator(backbone1=backbone1,
+#         #                                             backbone2=backbone2,
+#         #                                             backbone3=backbone3,
+#         #                                             classifier=classifier,
+#         #                                             dataloader=testloader,
+#         #                                             device=device)
+#         #
+#         # log.info('Dirichlet score: {}'.format(score))
+#         #
+#         # if plot:
+#         #     log.info('Plotting.')
+#         #     images_path = os.path.join(experiment_path, 'images')
+#         #     os.makedirs(images_path, exist_ok=True)
+#         #
+#         #     if not os.path.exists(
+#         #             os.path.join(images_path, "flatten_embs.pdf")):
+#         #         loss_figure, score_figure = flat_embedding_plots(backbone1,
+#         #                                                          backbone2,
+#         #                                                          backbone3,
+#         #                                                          classifier,
+#         #                                                          testloader,
+#         #                                                          device=device)
+#         #
+#         #         loss_figure.savefig(
+#         #             os.path.join(images_path, "flatten_embs.pdf"),
+#         #             bbox_inches='tight')
+#         #         plt.close(loss_figure)
+#         #
+#         #         score_figure.savefig(
+#         #             os.path.join(images_path, "flatten_embs_score.pdf"),
+#         #             bbox_inches='tight')
+#         #         plt.close(score_figure)
+#         #
+#         #     # if not os.path.exists(os.path.join(images_path, "weights_plot.pdf")):
+#         #     #     figure, figure_score = weights_plot(b1, b2, b3, classifier,
+#         #     #                                         testloader,
+#         #     #                                         criterion=criterion,
+#         #     #                                         device=device)
+#         #     #
+#         #     #     figure.savefig(os.path.join(images_path, "weights_plot.pdf"),
+#         #     #                    bbox_inches='tight')
+#         #     #     plt.close(figure)
+#         #     #
+#         #     #     figure_score.savefig(os.path.join(images_path, "weights_score.pdf"),
+#         #     #                          bbox_inches='tight')
+#         #     #     plt.close(figure_score)
+#         #     #
+#         #     # if not os.path.exists(
+#         #     #         os.path.join(images_path, "model_similarity.pdf")):
+#         #     #     figure = model_cosine_similarity_plot(b1, b2, b3, classifier,
+#         #     #                                           testloader,
+#         #     #                                           criterion=criterion,
+#         #     #                                           device=device)
+#         #     #
+#         #     #     figure.savefig(os.path.join(images_path, "model_similarity.pdf"),
+#         #     #                    bbox_inches='tight')
+#         #     #     plt.close(figure)
+#         #
+#         #     if not os.path.exists(
+#         #             os.path.join(images_path, "flatten_embs_similarity.pdf")):
+#         #         figure = flat_embedding_cosine_similarity_plot(backbone1,
+#         #                                                        backbone2,
+#         #                                                        backbone3,
+#         #                                                        classifier,
+#         #                                                        testloader,
+#         #                                                        device=device)
+#         #         figure.savefig(
+#         #             os.path.join(images_path, "flatten_embs_similarity.pdf"),
+#         #             bbox_inches='tight')
+#         #         plt.close(figure)
+#         #
+#         #     # if not os.path.exists(
+#         #     #         os.path.join(images_path, "logits_similarity.pdf")):
+#         #     #     figure = logits_cosine_similarity_plot(b1, b2, b3, classifier,
+#         #     #                                            testloader,
+#         #     #                                            criterion=criterion,
+#         #     #                                            device=device)
+#         #     #     figure.savefig(
+#         #     #         os.path.join(images_path, "logits_similarity.pdf"),
+#         #     #         bbox_inches='tight')
+#         #     #     plt.close(figure)
+#         #     #
+#         #     # if not os.path.exists(
+#         #     #         os.path.join(images_path, "similarity_0.pdf")):
+#         #     #
+#         #     #     figures = embedding_cosine_similarity_plot(b1, b2, b3,
+#         #     #                                                classifier,
+#         #     #                                                testloader,
+#         #     #                                                criterion=criterion,
+#         #     #                                                device=device)
+#         #     #
+#         #     #     for label, figure in figures:
+#         #     #         figure.savefig(
+#         #     #             os.path.join(images_path,
+#         #     #                          "similarity_{}.pdf".format(label)),
+#         #     #             bbox_inches='tight')
+#         #     #         plt.close(figure)
+#         #     #
+#         #     # if not os.path.exists(
+#         #     #         os.path.join(images_path, "loss_space_class_0.pdf")):
+#         #     #
+#         #     #     figures = classes_embedding_plots(b1, b2, b3, classifier,
+#         #     #                                       testloader,
+#         #     #                                       criterion=criterion,
+#         #     #                                       device=device)
+#         #     #
+#         #     #     for label, figure in figures:
+#         #     #         figure.savefig(
+#         #     #             os.path.join(images_path,
+#         #     #                          "loss_space_class{}.pdf".format(label)),
+#         #     #             bbox_inches='tight')
+#         #     #         plt.close(figure)
+#
+#         if plot:
+#             log.info('Plotting.')
+#             images_path = os.path.join(experiment_path, 'images')
+#             os.makedirs(images_path, exist_ok=True)
+#             #
+#             # if not os.path.exists(
+#             #         os.path.join(images_path, "flatten_embs.pdf")):
+#             #     loss_figure, score_figure = flat_embedding_plots(backbone,
+#             #                                                      classifiers,
+#             #                                                      testloader,
+#             #                                                      device=device)
+#             #
+#             #     loss_figure.savefig(
+#             #         os.path.join(images_path, "flatten_embs.pdf"),
+#             #         bbox_inches='tight')
+#             #     plt.close(loss_figure)
+#             #
+#             #     score_figure.savefig(
+#             #         os.path.join(images_path, "flatten_embs_score.pdf"),
+#             #         bbox_inches='tight')
+#             #     plt.close(score_figure)
+#
+#             # if logits_training:
+#             loss_figure, score_figure = flat_logits_plots(backbone,
+#                                                           classifiers,
+#                                                           testloader,
+#                                                           grid_points=100,
+#                                                           plot_offsets=1,
+#                                                           device=device)
+#
+#             loss_figure.savefig(
+#                 os.path.join(images_path, "flatten_logits.pdf"),
+#                 bbox_inches='tight')
+#             plt.close(loss_figure)
+#
+#             score_figure.savefig(
+#                 os.path.join(images_path, "flatten_logits_score.pdf"),
+#                 bbox_inches='tight')
+#             plt.close(score_figure)
+#
+#             # if not os.path.exists(os.path.join(images_path, "weights_plot.pdf")):
+#             #     figure, figure_score = weights_plot(b1, b2, b3, classifier,
+#             #                                         testloader,
+#             #                                         criterion=criterion,
+#             #                                         device=device)
+#             #
+#             #     figure.savefig(os.path.join(images_path, "weights_plot.pdf"),
+#             #                    bbox_inches='tight')
+#             #     plt.close(figure)
+#             #
+#             #     figure_score.savefig(os.path.join(images_path, "weights_score.pdf"),
+#             #                          bbox_inches='tight')
+#             #     plt.close(figure_score)
+#             #
+#             # if not os.path.exists(
+#             #         os.path.join(images_path, "model_similarity.pdf")):
+#             #     figure = model_cosine_similarity_plot(b1, b2, b3, classifier,
+#             #                                           testloader,
+#             #                                           criterion=criterion,
+#             #                                           device=device)
+#             #
+#             #     figure.savefig(os.path.join(images_path, "model_similarity.pdf"),
+#             #                    bbox_inches='tight')
+#             #     plt.close(figure)
+#
+#             # if not os.path.exists(
+#             #         os.path.join(images_path, "flatten_embs_similarity.pdf")):
+#             #     figure = flat_embedding_cosine_similarity_plot(backbone1,
+#             #                                                    backbone2,
+#             #                                                    backbone3,
+#             #                                                    classifier,
+#             #                                                    testloader,
+#             #                                                    device=device)
+#             #     figure.savefig(
+#             #         os.path.join(images_path, "flatten_embs_similarity.pdf"),
+#             #         bbox_inches='tight')
+#             #     plt.close(figure)
+#
+#         log.info('#' * 100)
 
-        # params = 0
-        # if hasattr(method, 'models'):
-        #     models = method.models
-        # else:
-        #     models = [method.model]
-        #
-        # for m in models:
-        #     params += calculate_trainable_parameters(m)
-        #
-        # logger.info('Method {} has {} parameters'.format(method_name, params))
-        #
-        # ece, _, _, _ = ece_score(method, test_loader)
-        #
-        # logger.info('Ece score: {}'.format(ece))
+
+@hydra.main(config_path="configs",
+            config_name="config")
+def my_app(cfg: DictConfig) -> None:
+    print("Working directory : {}".format(os.getcwd()))
+
+    method_name = cfg['method']['name']
+    if method_name == 'bernulli':
+        bernulli(cfg)
+    # elif method_name == 'dirichlet_logits':
+    # dirichlet(cfg, logits_training=True)
+    # elif method_name == 'joint':
+    #     joint(cfg)
+    else:
+        raise ValueError('Supported methods are: [dirichlet, dirichlet_logits]')
+
+
+if __name__ == "__main__":
+    my_app()

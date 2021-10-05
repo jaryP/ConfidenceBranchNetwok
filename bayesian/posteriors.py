@@ -79,7 +79,7 @@ class BayesianHead(nn.Module):
         return o, l
 
 
-class BayesianHeads(nn.Module):
+class BayesianPredictors(nn.Module):
     def __init__(self, heads: List[BayesianHead]):
         super().__init__()
 
@@ -99,7 +99,7 @@ class BayesianHeads(nn.Module):
             reg_loss = 0
             log = logits
             log, r = self.predictors[branch_index](log)
-            losses += reg_loss
+            losses += r
 
             forwards.append(log)
 
@@ -152,9 +152,12 @@ class MatrixEmbedding(BayesianPosterior):
 
 class LayerEmbeddingBeta(BayesianPosterior):
     def __len__(self, *args, **kwargs):
+        if self.use_final:
+            return self.ln - 1
+
         return self.ln
 
-    def __init__(self, alpha_layers, beta_layers, min_clamp=1e-10, max_clamp=5):
+    def __init__(self, alpha_layers, beta_layers, use_final=False):
         super().__init__()
 
         if isinstance(alpha_layers, nn.ModuleList):
@@ -167,10 +170,7 @@ class LayerEmbeddingBeta(BayesianPosterior):
         self.beta_layer = beta_layers
         self.alpha_layers = alpha_layers
 
-        self.min_clamp = max(1e-10, min_clamp) if min_clamp \
-                                                  is not None else 1e-10
-        self.max_clamp = max(self.min_clamp, max_clamp) if max_clamp \
-                                                           is not None else None
+        self.use_final = use_final
 
         # betas = []
         # for o in range(n_branches):
@@ -222,7 +222,9 @@ class LayerEmbeddingBeta(BayesianPosterior):
         # a, b = ab.chunk(2, dim=1)
         # distribution = Beta(a, b)
         # return distribution.rsample([sample_shape]).mean(0)
+        samples = max(samples, 1)
         post = self.get_posterior(logits=logits, branch_index=branch_index)
+        # a = post.rsample([samples]) #.mean(0)
         return post.rsample([samples]).mean(0)
 
 
