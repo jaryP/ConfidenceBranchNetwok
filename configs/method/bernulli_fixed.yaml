@@ -1,3 +1,3 @@
 name: bernulli
+fixed_bernulli: true
 priors: [0.6, 0.4, 0.3, 0.2]
-joint_type: predictions

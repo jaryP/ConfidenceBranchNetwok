@@ -23,7 +23,8 @@ from torch import optim
 # from loss_landscape_branch.models.alexnet import AlexNet
 # from loss_landscape_branch.utils import get_intermediate_classifiers, \
 #     DirichletLogits, BranchExit, DirichletEmbeddings
-from base.trainer import binary_bernulli_trainer
+from base.evaluators import binary_eval, branches_entropy, standard_eval
+from base.trainer import binary_bernulli_trainer, joint_trainer
 from utils import get_dataset, get_optimizer, get_model
 
 
@@ -69,6 +70,15 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
     plot = experiment_cfg.get('plot', False)
 
     method_cfg = cfg['method']
+    method_name = method_cfg['name']
+
+    get_binaries = True if method_name == 'bernulli' else False
+
+    # trainer = None
+
+    # if method_name == 'bernulli':
+    #     trainer = binary_bernulli_trainer
+
     # distance_regularization, distance_weight, similarity = method_cfg.get(
     #     'distance_regularization', True), \
     #                                                        method_cfg.get(
@@ -86,7 +96,7 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
                                  training_cfg.get('device', 'cpu')
 
     optimizer_cfg = cfg['optimizer']
-    optimizer, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
+    optimizer_name, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
                                                               'sgd'), \
                                             optimizer_cfg.get('lr', 1e-1), \
                                             optimizer_cfg.get('momentum', 0.9), \
@@ -135,13 +145,17 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
         backbone, classifiers = get_model(model_name,
                                           image_size=input_size,
                                           classes=classes,
-                                          get_binaries=True)
+                                          get_binaries=get_binaries)
+
+        backbone.to(device)
+        classifiers.to(device)
 
         if os.path.exists(os.path.join(experiment_path, 'bb.pt')):
             backbone.load_state_dict(torch.load(
-                os.path.join(experiment_path, 'bb.pt')))
+                os.path.join(experiment_path, 'bb.pt'), map_location=device))
             classifiers.load_state_dict(torch.load(
-                os.path.join(experiment_path, 'classifiers.pt')))
+                os.path.join(experiment_path, 'classifiers.pt'),
+                map_location=device))
         else:
             log.info('Training started.')
 
@@ -154,73 +168,181 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
             parameters = chain(backbone.parameters(),
                                classifiers.parameters())
 
-            optimizer = get_optimizer(parameters=parameters, name=optimizer,
+            optimizer = get_optimizer(parameters=parameters, name=optimizer_name,
                                       lr=lr,
                                       momentum=momentum,
                                       weight_decay=weight_decay)
 
-            backbone, classifiers = binary_bernulli_trainer(model=backbone,
-                                                            predictors=classifiers,
-                                                            bernulli_models=classifiers,
-                                                            optimizer=optimizer,
-                                                            train_loader=trainloader,
-                                                            epochs=epochs,
-                                                            prior_parameters=[
-                                                                0.1, 0.2, 0.3,
-                                                                0.4, 0.6][::-1],
-                                                            # prior_w=prior_w,
-                                                            # cost_reg=1e-3,
-                                                            # use_mmd=False,
-                                                            # scheduler=None,
-                                                            # early_stopping=None,
-                                                            test_loader=testloader,
-                                                            # eval_loader=,
-                                                            # cumulative_prior=False,
-                                                            device=device)[:2]
+            if method_name == 'bernulli':
 
-        #     if logits_training:
-        #         backbone, classifiers = dirichlet_logits_model_train(
-        #             backbone=backbone,
-        #             classifiers=classifiers,
-        #             trainloader=trainloader,
-        #             testloader=testloader,
-        #             optimizer=optimizer,
-        #             distance_regularization=distance_regularization,
-        #             distance_weight=distance_weight,
-        #             similarity=similarity,
-        #             epochs=epochs,
-        #             anneal_dirichlet=anneal_dirichlet,
-        #             ensemble_dropout=ensemble_dropout,
-        #             test_samples=test_samples,
-        #             device=device)
-        #     else:
-        #         backbone, classifiers = dirichlet_model_train(
-        #             backbone=backbone,
-        #             classifiers=classifiers,
-        #             trainloader=trainloader,
-        #             testloader=testloader,
-        #             optimizer=optimizer,
-        #             distance_regularization=distance_regularization,
-        #             distance_weight=distance_weight,
-        #             similarity=similarity,
-        #             epochs=epochs,
-        #             anneal_dirichlet=anneal_dirichlet,
-        #             ensemble_dropout=ensemble_dropout,
-        #             test_samples=test_samples,
-        #             device=device)
-        #
-        #     # criterion=criterion,
-        #     # past_models=past_models,
-        #     # distance_regularization=distance_regularization,
-        #     # distance_weight=distance_weight,
-        #     # cosine_distance=cosine_distance,
-        #     # mode_connectivity=mode_connectivity,
-        #     # connect_to_last=connect_to_last)
-        #
+                priors = method_cfg.get('proprs', 0.5)
+                fixed_bernulli = method_cfg.get('fixed_bernulli', False)
+                joint_type = method_cfg.get('joint_type', 'predictions')
+
+                res = binary_bernulli_trainer(model=backbone,
+                                              predictors=classifiers,
+                                              bernulli_models=classifiers,
+                                              optimizer=optimizer,
+                                              train_loader=trainloader,
+                                              epochs=epochs,
+                                              prior_parameters=priors,
+                                              joint_type=joint_type,
+                                              # cost_reg=1e-3,
+                                              # use_mmd=False,
+                                              # scheduler=None,
+                                              # early_stopping=None,
+                                              test_loader=testloader,
+                                              fixed_bernulli=fixed_bernulli,
+                                              # eval_loader=,
+                                              device=device)[0]
+
+                backbone_dict, classifiers_dict = res
+
+                backbone.load_state_dict(backbone_dict)
+                classifiers.load_state_dict(classifiers_dict)
+
+            elif method_name == 'joint':
+                joint_type = method_cfg.get('joint_type', 'predictions')
+                weights = method_cfg.get('weights', None)
+                train_weights = method_cfg.get('train_weights', False)
+
+                if train_weights:
+                    weights = torch.tensor(weights, device=device,
+                                           dtype=torch.float)
+
+                    weights = weights.unsqueeze(-1)
+                    weights = weights.unsqueeze(-1)
+
+                    weights = torch.nn.Parameter(weights)
+                    parameters = chain(backbone.parameters(),
+                                       classifiers.parameters(),
+                                       [weights])
+
+                    optimizer = get_optimizer(parameters=parameters,
+                                              name=optimizer_name,
+                                              lr=lr,
+                                              momentum=momentum,
+                                              weight_decay=weight_decay)
+
+                res = joint_trainer(model=backbone, predictors=classifiers,
+                                    optimizer=optimizer,
+                                    weights=weights, train_loader=trainloader,
+                                    epochs=epochs, train_weights=train_weights,
+                                    scheduler=None, joint_type=joint_type,
+                                    early_stopping=None, test_loader=testloader,
+                                    eval_loader=None, device=device)[0]
+
+                backbone_dict, classifiers_dict = res
+
+                backbone.load_state_dict(backbone_dict)
+                classifiers.load_state_dict(classifiers_dict)
+
+            else:
+                assert False
+
+            # elif method_name == 'joint':
+            #     pass
+
+            #     if logits_training:
+            #         backbone, classifiers = dirichlet_logits_model_train(
+            #             backbone=backbone,
+            #             classifiers=classifiers,
+            #             trainloader=trainloader,
+            #             testloader=testloader,
+            #             optimizer=optimizer,
+            #             distance_regularization=distance_regularization,
+            #             distance_weight=distance_weight,
+            #             similarity=similarity,
+            #             epochs=epochs,
+            #             anneal_dirichlet=anneal_dirichlet,
+            #             ensemble_dropout=ensemble_dropout,
+            #             test_samples=test_samples,
+            #             device=device)
+            #     else:
+            #         backbone, classifiers = dirichlet_model_train(
+            #             backbone=backbone,
+            #             classifiers=classifiers,
+            #             trainloader=trainloader,
+            #             testloader=testloader,
+            #             optimizer=optimizer,
+            #             distance_regularization=distance_regularization,
+            #             distance_weight=distance_weight,
+            #             similarity=similarity,
+            #             epochs=epochs,
+            #             anneal_dirichlet=anneal_dirichlet,
+            #             ensemble_dropout=ensemble_dropout,
+            #             test_samples=test_samples,
+            #             device=device)
+            #
+            #     # criterion=criterion,
+            #     # past_models=past_models,
+            #     # distance_regularization=distance_regularization,
+            #     # distance_weight=distance_weight,
+            #     # cosine_distance=cosine_distance,
+            #     # mode_connectivity=mode_connectivity,
+            #     # connect_to_last=connect_to_last)
+            #
+
             torch.save(backbone.state_dict(), os.path.join(experiment_path,
                                                            'bb.pt'))
             torch.save(classifiers.state_dict(), os.path.join(experiment_path,
                                                               'classifiers.pt'))
+
+        train_scores = standard_eval(model=backbone,
+                                     dataset_loader=trainloader,
+                                     classifier=classifiers[-1],
+                                     device=device)
+
+        test_scores = standard_eval(model=backbone,
+                                    dataset_loader=testloader,
+                                    classifier=classifiers[-1],
+                                    device=device)
+
+        log.info(
+            'Last layer train and test scores : {}, {}'.format(train_scores,
+                                                               test_scores))
+
+        if method_name == 'bernulli':
+
+            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8]:
+                a, b = binary_eval(model=backbone,
+                                   dataset_loader=testloader,
+                                   predictors=classifiers,
+                                   device=device,
+                                   epsilon=epsilon,
+                                   cumulative_threshold=True)
+
+                log.info('Epsilon {} scores: {}, {}'.format(epsilon,
+                                                            dict(a), dict(b)))
+
+            for epsilon in [.2, .4, .5, .6, .7, .8]:
+                branches_score, counter = binary_eval(model=backbone,
+                                                      dataset_loader=testloader,
+                                                      predictors=classifiers,
+                                                      device=device,
+                                                      epsilon=[0.6] +
+                                                              [epsilon] *
+                                                              (
+                                                                      backbone.n_branches() - 1))
+
+                log.info('Threshold {} scores: {}, {}'.format(epsilon,
+                                                              dict(
+                                                                  branches_score),
+                                                              dict(counter)))
+
+        for entropy_threshold in [0.0001 , 0.01, 0.1, .2, .4, .5, .6, .7, .8]:
+            branches_score, counter = branches_entropy(model=backbone,
+                                                       dataset_loader=testloader,
+                                                       predictors=classifiers,
+                                                       device=device,
+                                                       threshold=entropy_threshold)
+
+            log.info(
+                'Entropy Threshold {} scores: {}, {}'.format(entropy_threshold,
+                                                             dict(
+                                                                 branches_score),
+                                                             dict(counter)))
+
         # log.info('Evaluation process')
         #
         # ff = BranchExit(model=backbone,
@@ -825,15 +947,15 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
 def my_app(cfg: DictConfig) -> None:
     print("Working directory : {}".format(os.getcwd()))
 
-    method_name = cfg['method']['name']
-    if method_name == 'bernulli':
-        bernulli(cfg)
+    # method_name = cfg['method']['name']
+    # if method_name == 'bernulli':
+    bernulli(cfg)
     # elif method_name == 'dirichlet_logits':
     # dirichlet(cfg, logits_training=True)
     # elif method_name == 'joint':
     #     joint(cfg)
-    else:
-        raise ValueError('Supported methods are: [dirichlet, dirichlet_logits]')
+    # else:
+    #     raise ValueError('Supported methods are: [dirichlet, dirichlet_logits]')
 
 
 if __name__ == "__main__":

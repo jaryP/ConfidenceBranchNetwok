@@ -117,8 +117,31 @@ def joint_trainer(model: BranchModel,
                   epochs,
                   scheduler=None,
                   weights=None,
+                  train_weights=False,
+                  joint_type='predictions',
                   early_stopping=None,
                   test_loader=None, eval_loader=None, device='cpu'):
+    if joint_type not in ['losses', 'predictions']:
+        raise ValueError
+
+    if weights is None:
+        weights = torch.tensor([1.0] * model.n_branches(), device=device)
+
+    if not isinstance(weights, (torch.Tensor, torch.nn.Parameter)):
+        if isinstance(weights, (int, float)):
+            weights = torch.tensor([weights] * model.n_branches(),
+                                   device=device, dtype=torch.float)
+
+        else:
+            weights = torch.tensor(weights, device=device, dtype=torch.float)
+
+        weights = weights.unsqueeze(-1)
+        weights = weights.unsqueeze(-1)
+
+    # if train_weights:
+    #     weights = nn.Parameter(weights)
+    #     optimizer.param_groups.append({'params': weights})
+
     scores = []
     mean_losses = []
 
@@ -143,24 +166,51 @@ def joint_trainer(model: BranchModel,
             predictors.train()
 
             x, y = x.to(device), y.to(device)
-            klw = 2 ** (len(train_loader) - i - 1) \
-                  / (2 ** len(train_loader) - 1)
+            # klw = 2 ** (len(train_loader) - i - 1) \
+            #       / (2 ** len(train_loader) - 1)
 
-            final_pred, preds = model(x)
-            loss = nn.functional.cross_entropy(final_pred, y,
-                                               reduction='mean')
-            for i, p in enumerate(preds):
-                if isinstance(predictors, BayesianPredictors):
-                    l, kl = predictors(logits=p, branch_index=i, samples=1)
-                    l = nn.functional.cross_entropy(l, y, reduction='mean')
-                    l += kl * klw
-                else:
-                    l = nn.functional.cross_entropy(predictors[i](p), y,
-                                                    reduction='mean')
-                if weights is not None:
-                    l *= weights[i]
+            preds = model(x)
+            logits = []
 
-                loss += l
+            for j, bo in enumerate(preds):
+                l = predictors[j].logits(bo)
+                logits.append(l)
+
+            preds = torch.stack(logits, 0)
+
+            if joint_type == 'predictions':
+                preds = weights * preds
+                f_hat = preds.sum(0)
+
+                # for i in reversed(range(0, len(preds))):
+                #     f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
+                #     gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
+
+                loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+
+            else:
+                losses = torch.stack(
+                    [nn.functional.cross_entropy(p, y, reduction='mean')
+                     for p in preds], 0)
+                # loss = nn.functional.cross_entropy(preds, y, reduction='none')
+                loss = losses * weights
+                # loss = loss.mean(1)
+                loss = loss.sum(0)
+
+            # loss = nn.functional.cross_entropy(final_pred, y,
+            #                                    reduction='mean')
+            # for i, p in enumerate(preds):
+            #     if isinstance(predictors, BayesianPredictors):
+            #         l, kl = predictors(logits=p, branch_index=i, samples=1)
+            #         l = nn.functional.cross_entropy(l, y, reduction='mean')
+            #         l += kl * klw
+            #     else:
+            #         l = nn.functional.cross_entropy(predictors[i](p), y,
+            #                                         reduction='mean')
+            #     if weights is not None:
+            #         l *= weights[i]
+            #
+            #     loss += l
 
             losses.append(loss.item())
 
@@ -208,8 +258,17 @@ def joint_trainer(model: BranchModel,
 
                 best_model_i = epoch
 
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1],
+                                     device=device)
+
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1],
+                                    device=device)
+
+        scores.append(test_scores)
 
         bar.set_postfix(
             {'Train score': train_scores, 'Test score': test_scores,
@@ -486,6 +545,8 @@ def binary_bernulli_trainer(model: BranchModel,
                             epochs,
                             prior_parameters,
                             prior_w=1e-3,
+                            fixed_bernulli=False,
+                            joint_type='predictions',
                             cost_reg=1e-3,
                             use_mmd=False,
                             scheduler=None,
@@ -494,6 +555,9 @@ def binary_bernulli_trainer(model: BranchModel,
                             eval_loader=None,
                             cumulative_prior=False,
                             device='cpu'):
+    if joint_type not in ['losses', 'predictions']:
+        raise ValueError
+
     if not isinstance(prior_parameters, list):
         # if not cumulative_prior:
         prior_parameters = [prior_parameters] * (len(predictors) - 1)
@@ -504,6 +568,7 @@ def binary_bernulli_trainer(model: BranchModel,
     for p in prior_parameters:
         beta = Bernoulli(p)
         beta_priors.append(beta)
+        # print(p)
 
     # sample_image = next(iter(train_loader))[0][1:2].to(device)
     # costs = branches_predictions(model, predictors, sample_image)
@@ -548,47 +613,65 @@ def binary_bernulli_trainer(model: BranchModel,
                 distributions.append(b)
                 logits.append(l)
 
+            preds = torch.stack(logits, 0)
+
             # distributions = [Bernoulli(bernulli_models[j].logits(bo))
             #                  for j, bo in enumerate(bos)]
 
             # distributions = [Bernoulli(bernulli_models[j](bo))
             #                  for j, bo in enumerate(bos)]
-
             kl = 0
 
-            for d, p in zip(distributions[:-1], beta_priors[:-1]):
-                # p = Bernoulli(torch.full(d.shape, p))
-                d = Bernoulli(d)
+            if not fixed_bernulli:
+                for d, p in zip(distributions[:-1], beta_priors[:-1]):
+                    # p = Bernoulli(torch.full(d.shape, p))
+                    d = Bernoulli(d)
 
-                kl += kl_divergence(d, p)
+                    kl += kl_divergence(d, p)
 
-            # if kl > 0:
-            kl = kl.mean()
+                # if kl > 0:
+                kl = kl.mean()
 
-            kl_losses.append(kl.item())
+                kl_losses.append(kl.item())
+
+                distributions = [Bernoulli(d).sample().to(device) for d in
+                                 distributions]
+            else:
+                kl_losses.append(0)
 
             # preds = [p(bo) for p, bo in zip(predictors, bos)]
-            preds = torch.stack(logits, 0)
 
-            ws = [Bernoulli(d).sample().to(device) for d in distributions]
-            ws = torch.stack(ws, 0)
+            distributions = torch.stack(distributions, 0)
             # ws = Softmax(0)(ws)
 
             # print(ws[:, 0])
-            ws[1:, :] *= torch.cumprod(1 - ws[:-1, :], 0)
+            distributions[1:, :] *= torch.cumprod(1 - distributions[:-1, :], 0)
             # print(ws.sum(0))
             # print(ws[:, 0])
             # f_hat = final_pred
             # gamma_hat = costs['final']
 
-            preds = preds * ws
-            f_hat = preds.sum(0)
+            if joint_type == 'predictions':
+                preds = preds * distributions
+                f_hat = preds.sum(0)
 
-            # for i in reversed(range(0, len(preds))):
-            #     f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-            #     gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
+                # for i in reversed(range(0, len(preds))):
+                #     f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
+                #     gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
 
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+                loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+
+            else:
+
+                loss = torch.stack(
+                    [nn.functional.cross_entropy(p, y, reduction='mean')
+                     for p in preds], 0)
+                # loss = nn.functional.cross_entropy(preds, y, reduction='none')
+                loss = loss * distributions
+                # print(loss.shape)
+                # loss = loss.mean(1)
+                loss = loss.sum(0)
+
             losses.append(loss.item())
 
             # gamma_hat = gamma_hat.mean() * cost_reg
@@ -611,11 +694,7 @@ def binary_bernulli_trainer(model: BranchModel,
             # klw = 2 ** (len(train_loader) - i - 1) \
             #       / (2 ** len(train_loader) - 1)
             kl *= prior_w
-            # print(kl, loss, gamma_hat)
-
             loss += kl
-
-            # print(loss.item(), kl.item())
 
             # pairwise_kl = 0
             # for p in range(len(ps) - 1):
@@ -672,28 +751,28 @@ def binary_bernulli_trainer(model: BranchModel,
             best_model_i = epoch
 
         with torch.no_grad():
-            a, b = binary_eval(model=model,
-                               dataset_loader=test_loader,
-                               predictors=predictors,
-                               device=device,
-                               epsilon=0.8,
-                               cumulative_threshold=True)
-
-            print(a, b)
-
-            branches_scores = branches_eval(model=model,
-                                            dataset_loader=test_loader,
-                                            predictors=predictors,
-                                            device=device)
-
-            branches_score, counter = binary_eval(model=model,
-                                                  dataset_loader=test_loader,
-                                                  predictors=predictors,
-                                                  device=device,
-                                                  epsilon=[0.7] +
-                                                          [0.5] * (model.n_branches() - 1))
-
-            print(branches_score, counter)
+            # a, b = binary_eval(model=model,
+            #                    dataset_loader=test_loader,
+            #                    predictors=predictors,
+            #                    device=device,
+            #                    epsilon=0.8,
+            #                    cumulative_threshold=True)
+            #
+            # print(a, b)
+            #
+            # branches_scores = branches_eval(model=model,
+            #                                 dataset_loader=test_loader,
+            #                                 predictors=predictors,
+            #                                 device=device)
+            #
+            # branches_score, counter = binary_eval(model=model,
+            #                                       dataset_loader=test_loader,
+            #                                       predictors=predictors,
+            #                                       device=device,
+            #                                       epsilon=[0.7] +
+            #                                               [0.5] * (model.n_branches() - 1))
+            #
+            # print(branches_score, counter)
 
             train_scores = standard_eval(model=model,
                                          dataset_loader=train_loader,
@@ -739,9 +818,9 @@ def binary_bernulli_trainer(model: BranchModel,
                 'Train score': train_scores, 'Test score': test_scores,
                 'Eval score': eval_scores if eval_scores != 0 else 0,
                 'Mean loss': mean_loss, 'mean kl loss': mean_kl_loss
-        })
-                # 'exit scores': branches_scores,
-                # 'branches score': branches_score}
+            })
+        # 'exit scores': branches_scores,
+        # 'branches score': branches_score}
         # )
         # scores.append((train_scores, eval_scores, test_scores))
         #

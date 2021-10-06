@@ -157,25 +157,28 @@ def branches_entropy(model: BranchModel,
     if isinstance(threshold, float):
         threshold = [threshold] * model.n_branches()
 
+    # exits_counter = defaultdict(int)
+    #
+    # true_labels = defaultdict(list)
+    # pred_labels = defaultdict(list)
+    #
     exits_counter = defaultdict(int)
-
-    true_labels = defaultdict(list)
-    pred_labels = defaultdict(list)
+    exits_corrected = defaultdict(int)
 
     for x, y in dataset_loader:
         x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
 
-        logits = []
+        preds = model(x)
 
-        for i, predictor in enumerate(predictors):
-            if isinstance(predictor, BayesianHead):
-                p = predictor(logits=preds[i],
-                              branch_index=i, samples=samples)
-            else:
-                p = predictor(preds[i])
+        distributions, logits = [], []
 
-            logits.append(p)
+        for j, bo in enumerate(preds):
+            l = predictors[j].logits(bo)
+            # distributions.append(b)
+            logits.append(l)
+
+        # distributions = torch.stack(distributions, 0)
+        logits = torch.stack(logits, 0)
 
         for bi in range(x.shape[0]):
             found = False
@@ -187,47 +190,77 @@ def branches_entropy(model: BranchModel,
                 # print(bi, i, h.sum())
                 h = h / np.log(sf.shape[-1])
                 h = h.sum()
+
                 if h < threshold[i]:
-                    top_classes = torch.topk(p, p.size(-1))[1]
-                    pred_labels[i].append(top_classes.tolist())
-                    true_labels[i].append(y[bi].item())
+                    pred = torch.argmax(p)
+
+                    if pred == y[bi]:
+                        exits_corrected[i] += 1
+
+                    # total += y.size(0)
+                    # correct += (pred == y).sum().item()
+                    #
+                    # top_classes = torch.topk(p, p.size(-1))[1]
+                    #
+                    # pred_labels[i].append(top_classes.tolist())
+                    # true_labels[i].append(y[bi].item())
+                    #
+                    # exits_counter[i] += 1
+                    # top_classes = torch.topk(p, p.size(-1))[1]
+                    # pred_labels[i].append(top_classes.tolist())
+                    # true_labels[i].append(y[bi].item())
                     exits_counter[i] += 1
                     found = True
                     break
 
             if not found:
-                top_classes = \
-                    torch.topk(final_preds[bi], final_preds.size(-1))[1]
-                true_labels['final'].append(y[bi].item())
-                pred_labels['final'].append(top_classes.tolist())
-                exits_counter['final'] += 1
+                i = len(predictors) - 1
+                p = logits[i][bi]
 
-        # true_labels = np.asarray(true_labels)
-    scores = {i: accuracy_score(true_labels[i], p, topk=topk)
-              for i, p in pred_labels.items()}
+                exits_counter[i] += 1
+                pred = torch.argmax(p)
 
-    keys = list(range(model.n_branches())) + ['final']
-    all_labels = []
-    all_preds = []
+                if pred == y[bi]:
+                    exits_corrected[i] += 1
+                # exits_counter[i] += 1
 
-    for k in keys:
-        if len(true_labels[k]) == 0:
-            continue
-        all_labels.append(true_labels[k])
-        all_preds.append(pred_labels[k])
+                # top_classes = \
+                #     torch.topk(final_preds[bi], final_preds.size(-1))[1]
+                # true_labels['final'].append(y[bi].item())
+                # pred_labels['final'].append(top_classes.tolist())
+                # exits_counter['final'] += 1
 
-    all_labels = np.concatenate(all_labels)
-    all_preds = np.concatenate(all_preds, 0)
+    branches_scores = {}
+    tot = 0
+    correctly_predicted = 0
+
+    # print(exits_corrected)
+    # print(exits_counter)
+
+    for k in exits_corrected:
+        correct = exits_corrected[k]
+        counter = exits_counter.get(k, 0)
+
+        if counter == 0:
+            score = 0
+        else:
+            score = correct / counter
+
+        branches_scores[k] = score
+
+        tot += counter
+        correctly_predicted += correct
 
     # all_labels = np.concatenate(
-    #     [true_labels[i] for i, p in pred_labels.items()])
-    # all_preds = np.concatenate([p for i, p in pred_labels.items()], 0)
+    #     [true_labels[i] for i, p in pred_labels.items() if len(p) > 0])
+    # all_preds = np.concatenate(
+    #     [p for i, p in pred_labels.items() if len(p) > 0], 0)
 
-    scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
+    branches_scores['global'] = correctly_predicted / tot
 
     # scores['branches_counter'] = exits_counter
 
-    return scores, exits_counter
+    return branches_scores, exits_counter
 
 
 @torch.no_grad()
@@ -373,9 +406,6 @@ def binary_eval(model: BranchModel,
         x, y = x.to(device), y.to(device)
 
         preds = model(x)
-
-        hs = []
-        predictions = []
 
         distributions, logits = [], []
 
