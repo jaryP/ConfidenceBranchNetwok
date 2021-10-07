@@ -8,13 +8,14 @@ case $DATASET in
 
   mnist)
   python main.py +dataset=mnist +method=bernulli experiment=base +model=alexnet optimizer=sgd_momentum +training=mnist training.epochs=30 hydra.run.dir='./outputs/mnist/bernulli' training.device="$DEVICE"
-  python main.py +dataset=mnist +method=bernulli method.joint_type=losses experiment=base +model=alexnet optimizer=sgd_momentum +training=mnist training.epochs=30 hydra.run.dir='./outputs/mnist/bernulli_losses' training.device="$DEVICE"
+#  python main.py +dataset=mnist +method=bernulli method.joint_type=losses experiment=base +model=alexnet optimizer=sgd_momentum +training=mnist training.epochs=30 hydra.run.dir='./outputs/mnist/bernulli_losses' training.device="$DEVICE"
 #  python main.py +dataset=mnist +method=bernulli_fixed experiment=base +model=alexnet optimizer=sgd_momentum +training=mnist training.epochs=30 hydra.run.dir='./outputs/mnist/bernulli_fixed' training.device="$DEVICE"
     ;;
-#
-#  cifar10)
+
+  cifar10)
 #  python main.py +dataset=cifar10 experiment=base +model=resnet20 optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/' +attacks=ps training.device="$DEVICE"
-#    ;;
+  python main.py +dataset=cifar10 +method=bernulli experiment=base +model=resnet20 optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/bernulli' training.device="$DEVICE"
+    ;;
 #
 #  tinyimagenet)
 #  python main.py +dataset=tinyimagenet experiment=base +model=resnet18 optimizer=sgd_momentum +training=tinyimagenet hydra.run.dir='./outputs/tinyimagenet/' +attacks=ps_tiny training.device="$DEVICE"

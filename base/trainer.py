@@ -23,6 +23,7 @@ from models.base import BranchModel, branches_predictions
 
 
 def standard_trainer(model: BranchModel,
+                     predictors: nn.Module,
                      optimizer,
                      train_loader,
                      epochs,
@@ -48,7 +49,9 @@ def standard_trainer(model: BranchModel,
         losses = []
         for i, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
-            pred, _ = model(x)
+            pred = model(x)[-1]
+            pred = predictors[-1].logits(pred)
+
             loss = nn.functional.cross_entropy(pred, y, reduction='none')
             losses.extend(loss.tolist())
             loss = loss.mean()
@@ -79,7 +82,7 @@ def standard_trainer(model: BranchModel,
             if r < 0:
                 break
             elif r > 0:
-                best_model = model.state_dict()
+                best_model = (model.state_dict(), predictors.state_dict())
                 best_model_i = epoch
         else:
             if (eval_scores is not None and eval_scores.get(1,
@@ -87,12 +90,19 @@ def standard_trainer(model: BranchModel,
                 if eval_scores is not None:
                     best_eval_score = eval_scores.get(1, 0)
 
-                best_model = model.state_dict()
+                best_model = (model.state_dict(), predictors.state_dict())
 
                 best_model_i = epoch
 
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1],
+                                     device=device)
+
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1],
+                                    device=device)
 
         # score_dict = {'Train score': train_scores, 'Test score': test_scores,
         #               'Eval score': eval_scores if eval_scores != 0 else 0}
@@ -189,13 +199,13 @@ def joint_trainer(model: BranchModel,
                 loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
 
             else:
-                losses = torch.stack(
+                loss = torch.stack(
                     [nn.functional.cross_entropy(p, y, reduction='mean')
                      for p in preds], 0)
                 # loss = nn.functional.cross_entropy(preds, y, reduction='none')
-                loss = losses * weights
+                loss = loss * weights
                 # loss = loss.mean(1)
-                loss = loss.sum(0)
+                loss = loss.sum()
 
             # loss = nn.functional.cross_entropy(final_pred, y,
             #                                    reduction='mean')
@@ -558,13 +568,14 @@ def binary_bernulli_trainer(model: BranchModel,
     if joint_type not in ['losses', 'predictions']:
         raise ValueError
 
-    if not isinstance(prior_parameters, list):
+    if isinstance(prior_parameters, (float, int)):
         # if not cumulative_prior:
         prior_parameters = [prior_parameters] * (len(predictors) - 1)
     # else:
     #     cumulative_prior = False
 
     beta_priors = []
+
     for p in prior_parameters:
         beta = Bernoulli(p)
         beta_priors.append(beta)
@@ -623,7 +634,10 @@ def binary_bernulli_trainer(model: BranchModel,
             kl = 0
 
             if not fixed_bernulli:
-                for d, p in zip(distributions[:-1], beta_priors[:-1]):
+                # input(preds.shape)
+                # input(len(distributions))
+
+                for d, p in zip(distributions[:-1], beta_priors):
                     # p = Bernoulli(torch.full(d.shape, p))
                     d = Bernoulli(d)
 
@@ -662,15 +676,23 @@ def binary_bernulli_trainer(model: BranchModel,
                 loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
 
             else:
-
+                
+                # loss = torch.stack(
+                #     [nn.functional.cross_entropy(p, y, reduction='mean')
+                #      for p in preds], 0)
+                # # loss = nn.functional.cross_entropy(preds, y, reduction='none')
+                # loss = loss * distributions
+                # # print(loss.shape)
+                # # loss = loss.mean(1)
+                # loss = loss.sum(0)
                 loss = torch.stack(
                     [nn.functional.cross_entropy(p, y, reduction='mean')
                      for p in preds], 0)
                 # loss = nn.functional.cross_entropy(preds, y, reduction='none')
+                print(distributions, loss.shape)
                 loss = loss * distributions
-                # print(loss.shape)
                 # loss = loss.mean(1)
-                loss = loss.sum(0)
+                loss = loss.sum()
 
             losses.append(loss.item())
 

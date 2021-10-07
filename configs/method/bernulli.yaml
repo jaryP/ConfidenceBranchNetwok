@@ -1,3 +1,5 @@
 name: bernulli
-priors: [0.6, 0.4, 0.3, 0.2]
+priors:
+  - 0.6
+  - 0.4
 joint_type: predictions

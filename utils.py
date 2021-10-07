@@ -7,6 +7,8 @@ from torchvision import datasets
 from torchvision.transforms import Resize, ToTensor, Normalize, Compose, \
     RandomHorizontalFlip, RandomCrop
 
+from models.resnet import resnet20
+
 
 def get_intermediate_classifiers(model,
                                  image_size,
@@ -14,97 +16,99 @@ def get_intermediate_classifiers(model,
                                  equalize_embedding=False,
                                  binary_branch=False):
     predictors = nn.ModuleList()
-    if isinstance(model, AlexNet):
-        # model = AlexNet(num_classes=num_classes)
-        x = torch.randn((1,) + image_size)
-        outputs = model(x)
+    # if isinstance(model, AlexNet):
+    # model = AlexNet(num_classes=num_classes)
+    x = torch.randn((1,) + image_size)
+    outputs = model(x)
 
-        for i, o in enumerate(outputs):
-            chs = o.shape[1]
+    for i, o in enumerate(outputs):
+        chs = o.shape[1]
 
-            if i == (len(outputs) - 1):
-                od = torch.flatten(o, 1).shape[-1]
-                # od = output.shape[-1]
+        if i == (len(outputs) - 1):
+            od = torch.flatten(o, 1).shape[-1]
+            # od = output.shape[-1]
 
-                linear_layers = nn.Sequential(*[nn.ReLU(),
-                                                nn.Linear(od, num_classes)])
+            linear_layers = nn.Sequential(*[nn.ReLU(),
+                                            nn.Linear(od, num_classes)])
 
-                if binary_branch:
-                    b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
-                                                 classifier=linear_layers,
-                                                 constant_binary_output=1.0)
-                else:
-                    b = IntermediateBranch(preprocessing=nn.Flatten(),
-                                           classifier=linear_layers)
-
-                predictors.append(b)
+            if binary_branch:
+                b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
+                                             classifier=linear_layers,
+                                             constant_binary_output=1.0)
             else:
-                if i == 0:
-                    seq = nn.Sequential(nn.MaxPool2d(3),
-                                        nn.Conv2d(64, 128, kernel_size=3),
-                                        nn.ReLU(),
-                                        nn.Conv2d(128, 128, kernel_size=3),
-                                        nn.ReLU())
-                else:
-                    seq = nn.Sequential(nn.MaxPool2d(3),
-                                        nn.Conv2d(chs, chs, kernel_size=3),
-                                        nn.ReLU())
+                b = IntermediateBranch(preprocessing=nn.Flatten(),
+                                       classifier=linear_layers)
 
-                seq.add_module('flatten', nn.Flatten())
+            predictors.append(b)
+        else:
+            if i == 0:
+                seq = nn.Sequential(nn.MaxPool2d(3),
+                                    nn.Conv2d(chs, chs * 2,
+                                              kernel_size=3),
+                                    nn.ReLU(),
+                                    nn.Conv2d(chs * 2, chs * 2,
+                                              kernel_size=3),
+                                    nn.ReLU())
+            else:
+                seq = nn.Sequential(nn.MaxPool2d(3),
+                                    nn.Conv2d(chs, chs, kernel_size=3),
+                                    nn.ReLU())
 
-                output = seq(o)
-                output = torch.flatten(output, 1)
-                od = output.shape[-1]
+            seq.add_module('flatten', nn.Flatten())
 
-                # if equalize_embedding:
-                #     seq.add_module('projector',
-                #                    nn.Sequential(nn.Linear(od, 4096),
-                #                                  nn.ReLU()))
-                #     predictors.append(IntermediateBranch(preprocessing=seq,
-                #                                          classifier=AlexnetClassifier(
-                #                                              num_classes)))
-                # else:
-                #
-                # linear_layers = []
+            output = seq(o)
+            output = torch.flatten(output, 1)
+            od = output.shape[-1]
 
-                linear_layers = nn.Sequential(*[nn.ReLU(),
-                                                nn.Linear(od, num_classes)])
+            # if equalize_embedding:
+            #     seq.add_module('projector',
+            #                    nn.Sequential(nn.Linear(od, 4096),
+            #                                  nn.ReLU()))
+            #     predictors.append(IntermediateBranch(preprocessing=seq,
+            #                                          classifier=AlexnetClassifier(
+            #                                              num_classes)))
+            # else:
+            #
+            # linear_layers = []
 
-                if binary_branch:
-                    # binary_layers = nn.Sequential(*[nn.Linear(od, od // 2),
-                    #                                 nn.ReLU(),
-                    #                                 nn.Linear(od // 2,
-                    #                                           1),
-                    #                                 nn.Sigmoid()]
+            linear_layers = nn.Sequential(*[nn.ReLU(),
+                                            nn.Linear(od, num_classes)])
 
-                    binary_layers = nn.Sequential(*[nn.ReLU(),
-                                                    nn.Linear(od, 1),
-                                                    nn.Sigmoid()])
+            if binary_branch:
+                # binary_layers = nn.Sequential(*[nn.Linear(od, od // 2),
+                #                                 nn.ReLU(),
+                #                                 nn.Linear(od // 2,
+                #                                           1),
+                #                                 nn.Sigmoid()]
 
-                    predictors.append(
-                        BinaryIntermediateBranch(preprocessing=seq,
-                                                 classifier=linear_layers,
-                                                 binary_classifier=binary_layers))
-                    emb, log = predictors[-1](o)
+                binary_layers = nn.Sequential(*[nn.ReLU(),
+                                                nn.Linear(od, 1),
+                                                nn.Sigmoid()])
 
-                else:
-                    predictors.append(IntermediateBranch(preprocessing=seq,
-                                                         classifier=linear_layers))
-                    log = predictors[-1](o)
-
-                # linear_layers.append(nn.Linear(od, od // 2))
-                # linear_layers.append(nn.ReLU())
-                # linear_layers.append(nn.Linear(od // 2, num_classes))
-                # linear_layers = nn.Sequential(*linear_layers)
-                #
-                # # predictors.append(linear_layers)
-                #
-                # predictors.append(IntermediateBranch(preprocessing=seq,
-                #                                      classifier=linear_layers))
+                predictors.append(
+                    BinaryIntermediateBranch(preprocessing=seq,
+                                             classifier=linear_layers,
+                                             binary_classifier=binary_layers))
                 # emb, log = predictors[-1](o)
 
-    else:
-        raise ValueError('Model must be instance of AlexNet')
+            else:
+                predictors.append(IntermediateBranch(preprocessing=seq,
+                                                     classifier=linear_layers))
+            predictors[-1](o)
+
+            # linear_layers.append(nn.Linear(od, od // 2))
+            # linear_layers.append(nn.ReLU())
+            # linear_layers.append(nn.Linear(od // 2, num_classes))
+            # linear_layers = nn.Sequential(*linear_layers)
+            #
+            # # predictors.append(linear_layers)
+            #
+            # predictors.append(IntermediateBranch(preprocessing=seq,
+            #                                      classifier=linear_layers))
+            # emb, log = predictors[-1](o)
+
+    # else:
+    #     raise ValueError('Model must be instance of AlexNet')
 
     return predictors
 
@@ -180,12 +184,12 @@ def get_model(name, image_size, classes, equalize_embedding=True,
     if name == 'alexnet':
         model = AlexNet(image_size[0])
         # return AlexNet(input_channels), AlexNetClassifier(classes)
-    # elif 'resnet' in name:
-    #     if name == 'resnet20':
+    elif 'resnet' in name:
+        if name == 'resnet20':
     #         model
-    #         return resnet20(None), ResnetClassifier(classes)
-    #     else:
-    #         assert False
+            model = resnet20(None)
+        else:
+            assert False
     else:
         assert False
 

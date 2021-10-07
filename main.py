@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+from copy import deepcopy
 from itertools import chain
 
 import hydra
@@ -24,7 +25,8 @@ from torch import optim
 # from loss_landscape_branch.utils import get_intermediate_classifiers, \
 #     DirichletLogits, BranchExit, DirichletEmbeddings
 from base.evaluators import binary_eval, branches_entropy, standard_eval
-from base.trainer import binary_bernulli_trainer, joint_trainer
+from base.trainer import binary_bernulli_trainer, joint_trainer, \
+    standard_trainer
 from utils import get_dataset, get_optimizer, get_model
 
 
@@ -97,10 +99,12 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
 
     optimizer_cfg = cfg['optimizer']
     optimizer_name, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
-                                                              'sgd'), \
-                                            optimizer_cfg.get('lr', 1e-1), \
-                                            optimizer_cfg.get('momentum', 0.9), \
-                                            optimizer_cfg.get('weight_decay', 0)
+                                                                   'sgd'), \
+                                                 optimizer_cfg.get('lr', 1e-1), \
+                                                 optimizer_cfg.get('momentum',
+                                                                   0.9), \
+                                                 optimizer_cfg.get(
+                                                     'weight_decay', 0)
 
     if torch.cuda.is_available() and device != 'cpu':
         torch.cuda.set_device(device)
@@ -157,25 +161,75 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
                 os.path.join(experiment_path, 'classifiers.pt'),
                 map_location=device))
         else:
-            log.info('Training started.')
+            if method_cfg.get('pre_trained', False):
+                pre_trained_path = os.path.join('~/branch_models/',
+                                                '{}'.format(dataset_name),
+                                                '{}'.format(model_name))
+
+                pre_trained_model_path = os.path.join(pre_trained_path,
+                                                      '{}.pt'.format(i))
+
+                if os.path.exists(pre_trained_model_path):
+                    log.info('Pre trained model loaded')
+                    log.info(pre_trained_model_path)
+
+                    backbone.load_state_dict(
+                        torch.load(pre_trained_model_path,
+                                   map_location=device))
+                else:
+
+                    os.makedirs(pre_trained_path, exist_ok=True)
+
+                    log.info('Training the base model')
+
+                    _classifiers = deepcopy(classifiers)
+                    parameters = chain(backbone.parameters(),
+                                       _classifiers.parameters())
+
+                    optimizer = get_optimizer(parameters=parameters,
+                                              name='adam',
+                                              lr=0.001,
+                                              momentum=None,
+                                              weight_decay=0)
+
+                    res = standard_trainer(model=backbone,
+                                           predictors=_classifiers,
+                                           optimizer=optimizer,
+                                           train_loader=trainloader,
+                                           epochs=epochs,
+                                           scheduler=None,
+                                           early_stopping=None,
+                                           test_loader=testloader,
+                                           eval_loader=None, device=device)[0]
+
+                    backbone_dict, classifiers_dict = res
+
+                    backbone.load_state_dict(backbone_dict)
+                    # classifiers.load_state_dict(classifiers_dict)
+
+                    torch.save(backbone.state_dict(), pre_trained_model_path)
+
+                    log.info('Pre trained model Saved.')
 
             # optimizer = optim.SGD(chain(backbone1.parameters(),
             #                             backbone2.parameters(),
             #                             backbone3.parameters(),
             #                             classifier.parameters()), lr=0.01,
             #                       momentum=0.9)
+            log.info('Training started.')
 
             parameters = chain(backbone.parameters(),
                                classifiers.parameters())
 
-            optimizer = get_optimizer(parameters=parameters, name=optimizer_name,
+            optimizer = get_optimizer(parameters=parameters,
+                                      name=optimizer_name,
                                       lr=lr,
                                       momentum=momentum,
                                       weight_decay=weight_decay)
 
             if method_name == 'bernulli':
 
-                priors = method_cfg.get('proprs', 0.5)
+                priors = method_cfg.get('priors', 0.5)
                 fixed_bernulli = method_cfg.get('fixed_bernulli', False)
                 joint_type = method_cfg.get('joint_type', 'predictions')
 
@@ -231,6 +285,23 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
                                     scheduler=None, joint_type=joint_type,
                                     early_stopping=None, test_loader=testloader,
                                     eval_loader=None, device=device)[0]
+
+                backbone_dict, classifiers_dict = res
+
+                backbone.load_state_dict(backbone_dict)
+                classifiers.load_state_dict(classifiers_dict)
+
+            elif method_name == 'standard':
+
+                res = standard_trainer(model=backbone,
+                                       predictors=classifiers,
+                                       optimizer=optimizer,
+                                       train_loader=trainloader,
+                                       epochs=epochs,
+                                       scheduler=None,
+                                       early_stopping=None,
+                                       test_loader=testloader,
+                                       eval_loader=None, device=device)[0]
 
                 backbone_dict, classifiers_dict = res
 
@@ -330,18 +401,21 @@ def bernulli(cfg: DictConfig, logits_training: bool = False):
                                                                   branches_score),
                                                               dict(counter)))
 
-        for entropy_threshold in [0.0001 , 0.01, 0.1, .2, .4, .5, .6, .7, .8]:
-            branches_score, counter = branches_entropy(model=backbone,
-                                                       dataset_loader=testloader,
-                                                       predictors=classifiers,
-                                                       device=device,
-                                                       threshold=entropy_threshold)
+        if method_name in ['bernulli', 'joint']:
+            for entropy_threshold in [0.0001, 0.01, 0.1, .2, .4, .5, .6, .7,
+                                      .8]:
+                branches_score, counter = branches_entropy(model=backbone,
+                                                           dataset_loader=testloader,
+                                                           predictors=classifiers,
+                                                           device=device,
+                                                           threshold=entropy_threshold)
 
-            log.info(
-                'Entropy Threshold {} scores: {}, {}'.format(entropy_threshold,
-                                                             dict(
-                                                                 branches_score),
-                                                             dict(counter)))
+                log.info(
+                    'Entropy Threshold {} scores: {}, {}'.format(
+                        entropy_threshold,
+                        dict(
+                            branches_score),
+                        dict(counter)))
 
         # log.info('Evaluation process')
         #

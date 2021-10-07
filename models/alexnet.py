@@ -11,7 +11,7 @@ class AlexNet(BranchModel, nn.Module):
     def __init__(self, channels=3):
         super(AlexNet, self).__init__()
 
-        self.b = 5
+        self.b = 3
         self.c1 = nn.Conv2d(channels, 64, kernel_size=3, stride=1, padding=2)
         self.c2 = nn.Conv2d(64, 192, kernel_size=3, padding=2)
         # nn.MaxPool2d(kernel_size=2)
@@ -92,10 +92,17 @@ class AlexNet(BranchModel, nn.Module):
         for i in range(1, 6):
             cl = getattr(self, 'c{}'.format(i))
             x = cl(x)
-            intermediate_layers.append(x)
+
+            if i in [1, 3]:
+                intermediate_layers.append(x)
+
             if i in [2, 3, 5]:
                 x = nn.functional.max_pool2d(x, kernel_size=2)
+
             x = torch.relu(x)
+
+        intermediate_layers.append(x)
+        # input(len(intermediate_layers))
 
         # x = self.c1(x)
         # intermediate_layers.append(x)
