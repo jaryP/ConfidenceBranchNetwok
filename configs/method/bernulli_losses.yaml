@@ -2,5 +2,5 @@ name: bernulli
 priors:
   - 0.6
   - 0.4
-joint_type: predictions
+joint_type: losses
 sample: true

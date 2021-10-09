@@ -3,4 +3,4 @@ priors:
   - 0.6
   - 0.4
 joint_type: predictions
-sample: true
+sample: false

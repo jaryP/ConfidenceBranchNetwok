@@ -10,14 +10,15 @@ from torchvision.transforms import Resize, ToTensor, Normalize, Compose, \
 from models.resnet import resnet20
 
 
+def get_device(model: nn.Module):
+    return next(model.parameters()).device
+
+
 def get_intermediate_classifiers(model,
                                  image_size,
                                  num_classes,
-                                 equalize_embedding=False,
                                  binary_branch=False):
     predictors = nn.ModuleList()
-    # if isinstance(model, AlexNet):
-    # model = AlexNet(num_classes=num_classes)
     x = torch.randn((1,) + image_size)
     outputs = model(x)
 
@@ -26,7 +27,6 @@ def get_intermediate_classifiers(model,
 
         if i == (len(outputs) - 1):
             od = torch.flatten(o, 1).shape[-1]
-            # od = output.shape[-1]
 
             linear_layers = nn.Sequential(*[nn.ReLU(),
                                             nn.Linear(od, num_classes)])
@@ -60,26 +60,10 @@ def get_intermediate_classifiers(model,
             output = torch.flatten(output, 1)
             od = output.shape[-1]
 
-            # if equalize_embedding:
-            #     seq.add_module('projector',
-            #                    nn.Sequential(nn.Linear(od, 4096),
-            #                                  nn.ReLU()))
-            #     predictors.append(IntermediateBranch(preprocessing=seq,
-            #                                          classifier=AlexnetClassifier(
-            #                                              num_classes)))
-            # else:
-            #
-            # linear_layers = []
-
             linear_layers = nn.Sequential(*[nn.ReLU(),
                                             nn.Linear(od, num_classes)])
 
             if binary_branch:
-                # binary_layers = nn.Sequential(*[nn.Linear(od, od // 2),
-                #                                 nn.ReLU(),
-                #                                 nn.Linear(od // 2,
-                #                                           1),
-                #                                 nn.Sigmoid()]
 
                 binary_layers = nn.Sequential(*[nn.ReLU(),
                                                 nn.Linear(od, 1),
@@ -89,104 +73,21 @@ def get_intermediate_classifiers(model,
                     BinaryIntermediateBranch(preprocessing=seq,
                                              classifier=linear_layers,
                                              binary_classifier=binary_layers))
-                # emb, log = predictors[-1](o)
 
             else:
                 predictors.append(IntermediateBranch(preprocessing=seq,
                                                      classifier=linear_layers))
             predictors[-1](o)
 
-            # linear_layers.append(nn.Linear(od, od // 2))
-            # linear_layers.append(nn.ReLU())
-            # linear_layers.append(nn.Linear(od // 2, num_classes))
-            # linear_layers = nn.Sequential(*linear_layers)
-            #
-            # # predictors.append(linear_layers)
-            #
-            # predictors.append(IntermediateBranch(preprocessing=seq,
-            #                                      classifier=linear_layers))
-            # emb, log = predictors[-1](o)
-
-    # else:
-    #     raise ValueError('Model must be instance of AlexNet')
-
     return predictors
 
 
-# def get_intermediate_binary_classifiers(model,
-#                                         image_size,
-#                                         num_classes,
-#                                         equalize_embedding=False):
-#     predictors = nn.ModuleList()
-#     if isinstance(model, AlexNet):
-#         # model = AlexNet(num_classes=num_classes)
-#         x = torch.randn((1,) + image_size)
-#         outputs = model(x)
-#
-#         for i, o in enumerate(outputs):
-#             chs = o.shape[1]
-#
-#             if i == (len(outputs) - 1):
-#                 # continue
-#                 predictors.append(IntermediateBranch(FakeIntermediateBranch()))
-#             else:
-#                 if i == 0:
-#                     seq = nn.Sequential(nn.MaxPool2d(3),
-#                                         nn.Conv2d(64, 128, kernel_size=3),
-#                                         nn.ReLU(),
-#                                         nn.Conv2d(128, 128, kernel_size=3),
-#                                         nn.ReLU())
-#                 else:
-#                     seq = nn.Sequential(nn.MaxPool2d(3),
-#                                         nn.Conv2d(chs, chs, kernel_size=3),
-#                                         nn.ReLU())
-#
-#                 seq.add_module('flatten', nn.Flatten())
-#
-#                 output = seq(o)
-#                 output = torch.flatten(output, 1)
-#                 od = output.shape[-1]
-#
-#                 # if equalize_embedding:
-#                 #     seq.add_module('projector',
-#                 #                    nn.Sequential(nn.Linear(od, 4096),
-#                 #                                  nn.ReLU()))
-#                 #     predictors.append(IntermediateBranch(preprocessing=seq,
-#                 #                                          classifier=AlexnetClassifier(
-#                 #                                              1)))
-#                 #     predictors.append(nn.Sigmoid())
-#
-#                 # else:
-#                 linear_layers = []
-#
-#                 linear_layers.append(nn.Linear(od, od // 2))
-#                 linear_layers.append(nn.ReLU())
-#                 linear_layers.append(nn.Linear(od // 2, 1))
-#                 linear_layers.append(nn.Sigmoid())
-#
-#                 linear_layers = nn.Sequential(*linear_layers)
-#
-#                 # predictors.append(linear_layers)
-#
-#                 predictors.append(IntermediateBranch(preprocessing=seq,
-#                                                      classifier=linear_layers))
-#                 emb, log = predictors[-1](o)
-#
-#     else:
-#         raise ValueError('Model must be instance of AlexNet')
-#
-#     return predictors
-
-
-def get_model(name, image_size, classes, equalize_embedding=True,
-              get_binaries=False):
+def get_model(name, image_size, classes, get_binaries=False):
     name = name.lower()
     if name == 'alexnet':
         model = AlexNet(image_size[0])
-        # return AlexNet(input_channels), AlexNetClassifier(classes)
     elif 'resnet' in name:
         if name == 'resnet20':
-    #         model
             model = resnet20(None)
         else:
             assert False
@@ -196,7 +97,6 @@ def get_model(name, image_size, classes, equalize_embedding=True,
     classifiers = get_intermediate_classifiers(model,
                                                image_size,
                                                classes,
-                                               equalize_embedding=equalize_embedding,
                                                binary_branch=get_binaries)
 
     return model, classifiers

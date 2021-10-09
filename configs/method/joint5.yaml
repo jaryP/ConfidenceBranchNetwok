@@ -1,0 +1,6 @@
+weights:
+  - 10
+  - 5
+  - 1
+name: joint
+pre_trained: true
