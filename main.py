@@ -61,6 +61,7 @@ def my_app(cfg: DictConfig) -> None:
     epochs, batch_size, device = training_cfg['epochs'], \
                                  training_cfg['batch_size'], \
                                  training_cfg.get('device', 'cpu')
+    eval_percentage = training_cfg.get('eval_split', None)
 
     optimizer_cfg = cfg['optimizer']
     optimizer_name, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
@@ -98,10 +99,32 @@ def my_app(cfg: DictConfig) -> None:
         experiment_path = os.path.join(path, 'exp_{}'.format(experiment))
         os.makedirs(experiment_path, exist_ok=True)
 
+        eval_loader = None
         train_set, test_set, input_size, classes = \
             get_dataset(name=dataset_name,
                         model_name=None,
                         augmentation=augmented_dataset)
+
+        if eval_percentage is not None and eval_percentage > 0:
+            assert eval_percentage < 1
+            train_len = len(train_set)
+            eval_len = int(train_len * eval_percentage)
+            train_len = train_len - eval_len
+
+            train_set, eval = torch.utils.data.random_split(train_set,
+                                                        [train_len, eval_len])
+            # train_loader = torch.utils.data.DataLoader(dataset=train,
+            #                                            batch_size=batch_size,
+            #                                            shuffle=True)
+            eval_loader = torch.utils.data.DataLoader(dataset=eval,
+                                                      batch_size=batch_size,
+                                                      shuffle=False)
+
+            # logger.info('Train dataset size: {}'.format(len(train)))
+            # logger.info('Test dataset size: {}'.format(len(test)))
+            # logger.info(
+            #     'Eval dataset created, having size: {}'.format(len(eval)))
+
 
         trainloader = torch.utils.data.DataLoader(train_set,
                                                   batch_size=batch_size,
@@ -135,17 +158,30 @@ def my_app(cfg: DictConfig) -> None:
                 pre_trained_path = os.path.expanduser(pre_trained_path)
 
                 pre_trained_model_path = os.path.join(pre_trained_path,
-                                                      '{}.pt'.format(
+                                                      'b{}.pt'.format(
                                                           experiment))
 
+                pre_trained_classifier_path = os.path.join(pre_trained_path,
+                                                           'c{}.pt'.format(
+                                                               experiment))
                 log.info('Pre trained model path {}'.
-                         format(pre_trained_model_path))
+                         format(pre_trained_path))
 
-                if os.path.exists(pre_trained_model_path):
+                pretrained_backbone, pretrained_classifiers = get_model(
+                    model_name,
+                    image_size=input_size,
+                    classes=classes,
+                    get_binaries=get_binaries)
+
+                if os.path.exists(pre_trained_model_path) and \
+                        os.path.exists(pre_trained_classifier_path):
                     log.info('Pre trained model loaded')
 
-                    backbone.load_state_dict(
+                    pretrained_backbone.load_state_dict(
                         torch.load(pre_trained_model_path,
+                                   map_location=device))
+                    pretrained_classifiers.load_state_dict(
+                        torch.load(pre_trained_classifier_path,
                                    map_location=device))
                 else:
 
@@ -153,15 +189,11 @@ def my_app(cfg: DictConfig) -> None:
 
                     log.info('Training the base model')
 
-                    _backbone, _classifiers = get_model(model_name,
-                                                        image_size=input_size,
-                                                        classes=classes,
-                                                        get_binaries=get_binaries)
-                    _backbone.to(device)
-                    _classifiers.to(device)
+                    pretrained_backbone.to(device)
+                    pretrained_classifiers.to(device)
 
-                    parameters = chain(_backbone.parameters(),
-                                       _classifiers.parameters())
+                    parameters = chain(pretrained_backbone.parameters(),
+                                       pretrained_classifiers.parameters())
 
                     optimizer = get_optimizer(parameters=parameters,
                                               name='sgd',
@@ -169,25 +201,43 @@ def my_app(cfg: DictConfig) -> None:
                                               momentum=0.9,
                                               weight_decay=0)
 
-                    res = standard_trainer(model=_backbone,
-                                           predictors=_classifiers,
+                    res = standard_trainer(model=pretrained_backbone,
+                                           predictors=pretrained_classifiers,
                                            optimizer=optimizer,
                                            train_loader=trainloader,
                                            epochs=epochs,
                                            scheduler=None,
                                            early_stopping=None,
                                            test_loader=testloader,
-                                           eval_loader=None, device=device)[0]
+                                           eval_loader=eval_loader)[0]
 
                     backbone_dict, classifiers_dict = res
-
-                    backbone.load_state_dict(backbone_dict)
                     # classifiers.load_state_dict(classifiers_dict)
+                    torch.save(backbone_dict,
+                               pre_trained_model_path)
+                    torch.save(classifiers_dict,
+                               pre_trained_classifier_path)
 
-                    torch.save(backbone.state_dict(), pre_trained_model_path)
-                    # torch.save(backbone.state_dict(), pre_trained_model_path)
+                    pretrained_classifiers.load_state_dict(classifiers_dict)
+                    pretrained_backbone.load_state_dict(backbone_dict)
 
                     log.info('Pre trained model Saved.')
+
+                # train_scores = standard_eval(model=pretrained_backbone,
+                #                              dataset_loader=trainloader,
+                #                              classifier=pretrained_classifiers[
+                #                                  -1])
+                #
+                # test_scores = standard_eval(model=pretrained_backbone,
+                #                             dataset_loader=testloader,
+                #                             classifier=pretrained_classifiers[
+                #                                 -1])
+                #
+                # log.info('Pre trained model scores : {}, {}'.format(
+                #     train_scores,
+                #     test_scores))
+
+                backbone.load_state_dict(pretrained_backbone.state_dict())
 
             backbone.to(device)
             classifiers.to(device)
@@ -215,6 +265,7 @@ def my_app(cfg: DictConfig) -> None:
                 joint_type = method_cfg.get('joint_type', 'predictions')
                 prior_w = method_cfg.get('prior_w', 1e-3)
                 sample = method_cfg.get('sample', True)
+                recursive = method_cfg.get('recursive', False)
 
                 res = binary_bernulli_trainer(model=backbone,
                                               predictors=classifiers,
@@ -226,6 +277,8 @@ def my_app(cfg: DictConfig) -> None:
                                               joint_type=joint_type,
                                               prior_w=prior_w,
                                               sample=sample,
+                                              eval_loader=eval_loader,
+                                              recursive=recursive,
                                               test_loader=testloader,
                                               fixed_bernulli=fixed_bernulli)[0]
 
@@ -281,7 +334,7 @@ def my_app(cfg: DictConfig) -> None:
                                        scheduler=None,
                                        early_stopping=None,
                                        test_loader=testloader,
-                                       eval_loader=None)[0]
+                                       eval_loader=eval_loader)[0]
 
                 backbone_dict, classifiers_dict = res
 
@@ -366,7 +419,7 @@ def my_app(cfg: DictConfig) -> None:
 
             log.info('Branches scores: {}'.format(scores))
 
-        if method_name == 'bernulli':
+        if 'bernulli' in method_name:
 
             cumulative_threshold_scores = {}
 
@@ -389,7 +442,6 @@ def my_app(cfg: DictConfig) -> None:
 
             binary_threshold_scores = {}
             for epsilon in [.2, .4, .5, .6, .7, .8]:
-
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,

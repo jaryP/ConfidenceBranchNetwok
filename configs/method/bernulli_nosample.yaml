@@ -1,6 +1,7 @@
 name: bernulli
 priors:
+  - 0.8
   - 0.6
-  - 0.4
 joint_type: predictions
-sample: false
+#sample: false
+prior_w: 0.01

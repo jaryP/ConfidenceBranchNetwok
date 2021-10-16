@@ -2,7 +2,6 @@ weights:
   - 1
   - 0.8
   - 0.6
-  - 0.4
-  - 0.4
 name: joint
 pre_trained: true
+joint_type: predictions

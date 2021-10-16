@@ -33,6 +33,7 @@ def _weights_init(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
         init.kaiming_normal_(m.weight)
 
+
 class LambdaLayer(nn.Module):
     def __init__(self, lambd):
         super(LambdaLayer, self).__init__()
@@ -71,18 +72,23 @@ class BasicBlock(nn.Module):
                 )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        # intermediate_layers = []
+        c1 = self.conv1(x)
+        # intermediate_layers.append(c1)
+        out = F.relu(self.bn1(c1))
+        c2 = self.conv2(out)
+        # intermediate_layers.append(c2)
+        out = self.bn2(c2)
         out += self.shortcut(x)
         out = F.relu(out)
-        return out
+        return out, [out]
 
 
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
         super(ResNet, self).__init__()
         self.in_planes = 16
-        self.b = 3
+        self.b = 10
 
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
@@ -95,6 +101,14 @@ class ResNet(nn.Module):
     def n_branches(self):
         return self.b
 
+    def iterate_blocks(self, x, blocks):
+        intermediate_o = []
+        for b in blocks:
+            x, int = b(x)
+            intermediate_o.extend(int)
+
+        return x, intermediate_o
+
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
@@ -102,18 +116,24 @@ class ResNet(nn.Module):
             layers.append(block(self.in_planes, planes, stride))
             self.in_planes = planes * block.expansion
 
-        return nn.Sequential(*layers)
+        # return nn.Sequential(*layers)
+        return nn.ModuleList(layers)
 
     def forward(self, x):
         intermediate_layers = []
-
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        intermediate_layers.append(out)
-        out = self.layer2(out)
-        intermediate_layers.append(out)
-        out = self.layer3(out)
+        c1 = self.conv1(x)
+        intermediate_layers.append(c1)
+        out = F.relu(self.bn1(c1))
+        # out, int = self.layer1(out)
+        out, int = self.iterate_blocks(out, self.layer1)
+        intermediate_layers.extend(int)
+        # out, int = self.layer2(out)
+        out, int = self.iterate_blocks(out, self.layer2)
+        intermediate_layers.extend(int)
+        # out, int = self.layer3(out)
+        out, int = self.iterate_blocks(out, self.layer3)
         out = F.avg_pool2d(out, out.size()[3])
+        intermediate_layers.extend(int[:-1])
         intermediate_layers.append(out)
 
         # out = out.view(out.size(0), -1)

@@ -32,29 +32,59 @@ def get_intermediate_classifiers(model,
                                             nn.Linear(od, num_classes)])
 
             if binary_branch:
+                # b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
+                #                              classifier=linear_layers,
+                #                              constant_binary_output=1.0)
+                # BinaryIntermediateBranch(preprocessing=seq,
+                #                          classifier=linear_layers,
+                #                          binary_classifier=binary_layers)
+
+                binary_layers = nn.Sequential(*[nn.ReLU(),
+                                                nn.Linear(od, 1),
+                                                nn.Sigmoid()])
+
                 b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                              classifier=linear_layers,
-                                             constant_binary_output=1.0)
+                                             binary_classifier=binary_layers)
             else:
                 b = IntermediateBranch(preprocessing=nn.Flatten(),
                                        classifier=linear_layers)
 
             predictors.append(b)
         else:
-            if i == 0:
-                seq = nn.Sequential(nn.MaxPool2d(3),
-                                    nn.Conv2d(chs, chs * 2,
-                                              kernel_size=3),
-                                    nn.ReLU(),
-                                    nn.Conv2d(chs * 2, chs * 2,
-                                              kernel_size=3),
-                                    nn.ReLU())
+
+            if o.shape[-1] >= 6:
+                seq = nn.Sequential(
+                    nn.ReLU(),
+                    nn.Conv2d(chs, 128,
+                              kernel_size=3, stride=1),
+                    nn.MaxPool2d(3),
+                    nn.ReLU())
             else:
-                seq = nn.Sequential(nn.MaxPool2d(3),
-                                    nn.Conv2d(chs, chs, kernel_size=3),
-                                    nn.ReLU())
+                seq = nn.Sequential(
+                    nn.ReLU(),
+                    nn.Conv2d(chs, 128,
+                              kernel_size=3, stride=1),
+                    # nn.MaxPool2d(2),
+                    nn.ReLU())
+            # if i == 0:
+            #     seq = nn.Sequential(
+            #         nn.ReLU(),
+            #         nn.Conv2d(chs, 128,
+            #                   kernel_size=3),
+            #         nn.MaxPool2d(3),
+            #         # nn.ReLU(),
+            #         # nn.Conv2d(chs * 2, chs * 2,
+            #         #           kernel_size=3),
+            #         nn.ReLU())
+            # else:
+            #     seq = nn.Sequential(nn.MaxPool2d(3),
+            #                         nn.ReLU(),
+            #                         nn.Conv2d(chs, 128, kernel_size=3),
+            #                         nn.ReLU())
 
             seq.add_module('flatten', nn.Flatten())
+            # print(o.shape)
 
             output = seq(o)
             output = torch.flatten(output, 1)

@@ -4,7 +4,7 @@ from typing import List, Union
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Dirichlet
+from torch.distributions import Dirichlet, ContinuousBernoulli
 from tqdm import tqdm
 
 # from bayesian.posteriors import BayesianPosterior, BayesianHead, \
@@ -335,7 +335,18 @@ def binary_eval(model: BranchModel,
                     #
                     #
                     # found = True
+                    found = True
                     break
+
+                # if not found:
+                #     i = len(predictors) - 1
+                #     p = logits[i][bi]
+                #
+                #     exits_counter[i] += 1
+                #     pred = torch.argmax(p)
+                #
+                #     if pred == y[bi]:
+                #         exits_corrected[i] += 1
 
                 # for i in range(len(binary_classifiers)):
                 #     logits = preds[i][bi].unsqueeze(0)

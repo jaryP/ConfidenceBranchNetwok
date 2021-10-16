@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import kl_divergence, Bernoulli
+from torch.distributions import kl_divergence, Bernoulli, ContinuousBernoulli
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tqdm import tqdm
 
@@ -18,7 +18,6 @@ def standard_trainer(model: BranchModel,
                      scheduler=None,
                      early_stopping=None,
                      test_loader=None, eval_loader=None):
-
     device = get_device(model)
 
     scores = []
@@ -58,15 +57,16 @@ def standard_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5])
+            eval_score = standard_eval(model, predictors[-1],
+                                       eval_loader)
         else:
-            eval_scores = None
+            eval_score = None
 
         mean_loss = sum(losses) / len(losses)
         mean_losses.append(mean_loss)
 
         if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+            r = early_stopping.step(eval_score) if eval_loader is not None \
                 else early_stopping.step(mean_loss)
 
             if r < 0:
@@ -75,10 +75,10 @@ def standard_trainer(model: BranchModel,
                 best_model = (model.state_dict(), predictors.state_dict())
                 best_model_i = epoch
         else:
-            if (eval_scores is not None and eval_scores.get(1,
-                                                            0) > best_eval_score) or eval_scores is None:
-                if eval_scores is not None:
-                    best_eval_score = eval_scores.get(1, 0)
+            if (eval_score is not None and eval_score > best_eval_score) \
+                    or eval_score is None:
+                if eval_score is not None:
+                    best_eval_score = eval_score
 
                 best_model = (model.state_dict(), predictors.state_dict())
 
@@ -94,10 +94,10 @@ def standard_trainer(model: BranchModel,
 
         bar.set_postfix(
             {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
+             'Eval score': eval_score if eval_score != 0 else 0,
              'Mean loss': mean_loss})
 
-        scores.append((train_scores, eval_scores, test_scores))
+        scores.append((train_scores, eval_score, test_scores))
 
     return best_model, \
            scores, \
@@ -115,7 +115,6 @@ def joint_trainer(model: BranchModel,
                   joint_type='predictions',
                   early_stopping=None,
                   test_loader=None, eval_loader=None):
-
     device = get_device(model)
 
     if joint_type not in ['losses', 'predictions']:
@@ -264,7 +263,8 @@ def binary_bernulli_trainer(model: BranchModel,
                             scheduler=None,
                             early_stopping=None,
                             test_loader=None,
-                            eval_loader=None):
+                            eval_loader=None,
+                            recursive=False):
 
     device = get_device(model)
 
@@ -277,7 +277,7 @@ def binary_bernulli_trainer(model: BranchModel,
     beta_priors = []
 
     for p in prior_parameters:
-        beta = Bernoulli(p)
+        beta = ContinuousBernoulli(p)
         beta_priors.append(beta)
 
     scores = []
@@ -303,8 +303,8 @@ def binary_bernulli_trainer(model: BranchModel,
         losses = []
         kl_losses = []
 
-        for i, (x, y) in tqdm(enumerate(train_loader), leave=False,
-                              total=len(train_loader)):
+        for bi, (x, y) in tqdm(enumerate(train_loader), leave=False,
+                               total=len(train_loader)):
 
             x, y = x.to(device), y.to(device)
             bos = model(x)
@@ -321,44 +321,75 @@ def binary_bernulli_trainer(model: BranchModel,
             kl = 0
 
             if not fixed_bernulli:
-                for d, p in zip(distributions[:-1], beta_priors):
-                    d = Bernoulli(d)
+                for d, p in zip(distributions, beta_priors):
+                    d = ContinuousBernoulli(d)
 
                     kl += kl_divergence(d, p)
 
-                kl = kl.mean()
+                kl = kl.mean() * prior_w
+                # kl = kl.mean()
 
                 kl_losses.append(kl.item())
 
+                # klw = 2 ** (len(train_loader) - bi - 1) \
+                #       / (2 ** len(train_loader) - 1)
+
+                # klw = 2 ** (epochs - epoch - 1) \
+                #       / (2 ** epochs - 1)
+                #
+                # kl *= klw
+
                 if sample:
-                    distributions = [Bernoulli(d).sample().to(device) for d in
+                    distributions = [ContinuousBernoulli(d).rsample()
+                                     # .to(device)
+                                     for d in
                                      distributions]
             else:
                 kl_losses.append(0)
 
             distributions = torch.stack(distributions, 0)
 
-            distributions[1:, :] *= torch.cumprod(1 - distributions[:-1, :], 0)
+            if recursive:
+                _pred = []
 
-            if joint_type == 'predictions':
-                preds = preds * distributions
-                f_hat = preds.sum(0)
+                y_output = preds[-1]
 
-                loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
+                for i in range(preds.shape[0] - 1, -1, -1):
+                    # for y_b, y_c in zip(preds[-2::-1], distributions[-2::-1]):
+                    # gate = torch.sigmoid(y_c)
+                    y_b = preds[i]
+                    y_c = distributions[i]
+
+                    y_output = y_b * y_c + (1 - y_c) * y_output
+
+                loss = nn.functional.cross_entropy(y_output, y,
+                                                   reduction='mean')
 
             else:
-                loss = torch.stack(
-                    [nn.functional.cross_entropy(p, y, reduction='none')
-                     for p in preds], 0)
 
-                distributions = distributions.squeeze(-1)
-                loss = loss * distributions
-                loss = loss.mean(1)
-                loss = loss.sum()
+                distributions[1:, :] *= torch.cumprod(1 - distributions[:-1, :],
+                                                      0)
+
+                if joint_type == 'predictions':
+                    preds = preds * distributions
+                    f_hat = preds.mean(0)
+
+                    loss = nn.functional.cross_entropy(f_hat, y,
+                                                       reduction='mean')
+
+                else:
+                    loss = torch.stack(
+                        [nn.functional.cross_entropy(p, y, reduction='none')
+                         for p in preds], 0)
+
+                    distributions = distributions.squeeze(-1)
+
+                    loss = loss * distributions
+                    loss = loss.mean(1)
+                    loss = loss.sum()
 
             losses.append(loss.item())
 
-            kl *= prior_w
             loss += kl
 
             optimizer.zero_grad()
@@ -403,6 +434,12 @@ def binary_bernulli_trainer(model: BranchModel,
                                     classifier=predictors[-1])
 
         scores.append(test_scores)
+
+        s = branches_eval(model=model,
+                          dataset_loader=test_loader,
+                          predictors=predictors)
+        s = dict(s)
+        print(s)
 
         mean_kl_loss = np.mean(kl_losses)
         mean_losses.append(mean_loss)

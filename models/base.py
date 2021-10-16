@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from functools import reduce
 from operator import mul
 
@@ -39,6 +40,10 @@ class BinaryIntermediateBranch(IntermediateBranch):
 
         super().__init__(classifier, preprocessing)
 
+        # self.c1 = deepcopy(self.classifier)
+        # self.c1.add_module('bin', nn.Linear(10, 1))
+        # self.c1.add_module('s', nn.Sigmoid())
+
         if binary_classifier is None and constant_binary_output is None:
             assert False
 
@@ -61,6 +66,7 @@ class BinaryIntermediateBranch(IntermediateBranch):
     def forward(self, x):
         embs = self.preprocess(x)
         logits = self.classifier(embs)
+        # bin = self.c1(embs)
         bin = self.binary_classifier(embs)
 
         return logits, bin
