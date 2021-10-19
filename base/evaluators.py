@@ -209,7 +209,7 @@ def entropy_eval(model: BranchModel,
     # print(exits_corrected)
     # print(exits_counter)
 
-    for k in exits_corrected:
+    for k in exits_counter:
         correct = exits_corrected[k]
         counter = exits_counter.get(k, 0)
 
@@ -273,6 +273,7 @@ def binary_eval(model: BranchModel,
             logits.append(l)
 
         distributions = torch.stack(distributions, 0)
+
         logits = torch.stack(logits, 0)
 
         # print(distributions.shape, logits.shape, x.shape)
@@ -386,7 +387,7 @@ def binary_eval(model: BranchModel,
     # print(exits_corrected)
     # print(exits_counter)
 
-    for k in exits_corrected:
+    for k in exits_counter:
         correct = exits_corrected[k]
         counter = exits_counter.get(k, 0)
 

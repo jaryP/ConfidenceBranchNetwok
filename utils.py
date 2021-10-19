@@ -41,7 +41,8 @@ def get_intermediate_classifiers(model,
 
                 binary_layers = nn.Sequential(*[nn.ReLU(),
                                                 nn.Linear(od, 1),
-                                                nn.Sigmoid()])
+                                                nn.Sigmoid()
+                                                ])
 
                 b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                              classifier=linear_layers,
@@ -97,7 +98,8 @@ def get_intermediate_classifiers(model,
 
                 binary_layers = nn.Sequential(*[nn.ReLU(),
                                                 nn.Linear(od, 1),
-                                                nn.Sigmoid()])
+                                                nn.Sigmoid()
+                                                ])
 
                 predictors.append(
                     BinaryIntermediateBranch(preprocessing=seq,

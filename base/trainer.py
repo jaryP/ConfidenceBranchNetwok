@@ -5,7 +5,7 @@ from torch.distributions import kl_divergence, Bernoulli, ContinuousBernoulli
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tqdm import tqdm
 
-from base.evaluators import standard_eval, branches_eval
+from base.evaluators import standard_eval, branches_eval, binary_eval
 from models.base import BranchModel
 from utils import get_device
 
@@ -316,40 +316,85 @@ def binary_bernulli_trainer(model: BranchModel,
                 distributions.append(b)
                 logits.append(l)
 
-            preds = torch.stack(logits, 0)
+            preds = torch.stack(logits, 1)
+            distributions = torch.stack(distributions, 1)
 
             kl = 0
 
             if not fixed_bernulli:
-                for d, p in zip(distributions, beta_priors):
-                    d = ContinuousBernoulli(d)
 
-                    kl += kl_divergence(d, p)
+                # PROVA CON KL ADATTIVO
+
+                with torch.no_grad():
+                    _y = y.unsqueeze(1)
+                    mx = torch.argmax(preds, -1)
+                    a = (mx == _y).float()
+
+                    if True:
+                        sf = torch.softmax(preds, -1)
+                        mx, _ = torch.max(sf, -1)
+                        a = a * mx
+
+                    # ones = torch.zeros_like(a)
+                    # ones[:, -1] = 1
+                    # a = torch.maximum(a, ones)
+
+                    a = a.unsqueeze(-1)
+
+                bce = nn.functional.binary_cross_entropy(
+                    distributions, a, reduction='none')
+
+                kl = bce.sum(-1)
+
+                # a = torch.maximum(a, prior_stack)
+                # d = ContinuousBernoulli(distributions)
+                # p = ContinuousBernoulli(a)
+                # kl = kl_divergence(d, p).sum(1)
+
+                # d = ContinuousBernoulli(torch.stack(distributions, 1)
+                #                         .squeeze(-1))
+                # # (pred == y).sum().item()
+                # _kl = kl_divergence(d, ContinuousBernoulli(a))
+                #
+                # kl = _kl.sum(-1)
+
+                # for d, p in zip(distributions, beta_priors):
+                #     d = ContinuousBernoulli(d)
+                #
+                #     _kl = kl_divergence(d, p).squeeze()
+                #     kl += _kl
 
                 kl = kl.mean() * prior_w
                 # kl = kl.mean()
 
                 kl_losses.append(kl.item())
 
-                # klw = 2 ** (len(train_loader) - bi - 1) \
-                #       / (2 ** len(train_loader) - 1)
-
-                # klw = 2 ** (epochs - epoch - 1) \
-                #       / (2 ** epochs - 1)
+                # klw = 2 ** (len(train_loader) - bi - 1) / \
+                #       (2 ** len(train_loader) - 1)
                 #
+                # # klw = 2 ** (epochs - epoch - 1) \
+                # #       / (2 ** epochs - 1)
+                # #
                 # kl *= klw
 
-                if sample:
-                    distributions = [ContinuousBernoulli(d).rsample()
-                                     # .to(device)
-                                     for d in
-                                     distributions]
+                # if sample:
+                #     distributions = [ContinuousBernoulli(d).rsample()
+                #                      # .to(device)
+                #                      for d in
+                #                      distributions]
             else:
                 kl_losses.append(0)
 
-            distributions = torch.stack(distributions, 0)
+            if sample:
+                distributions = ContinuousBernoulli(distributions).rsample()
+                # distributions = [ContinuousBernoulli(d).rsample()
+                #                  # .to(device)
+                #                  for d in
+                #                  distributions]
 
             if recursive:
+                assert False
+
                 _pred = []
 
                 y_output = preds[-1]
@@ -366,27 +411,86 @@ def binary_bernulli_trainer(model: BranchModel,
                                                    reduction='mean')
 
             else:
+                distributions[:, 1:, :] *= torch.cumprod(
+                    1 - distributions[:, :-1, :], 1)
 
-                distributions[1:, :] *= torch.cumprod(1 - distributions[:-1, :],
-                                                      0)
+                d = distributions
+                # d[:, 1:] *= torch.cumprod(1 - d[:, :-1], 1)
+
+                # distributions = distributions[:, 1:, :] * \
+                #                 torch.cumprod(1 - distributions[:, :-1, :], 1)
+
+                # drop = torch.full(distributions.shape[:2], 0.5,
+                #                   device=device)
+                #
+                # mask = torch.bernoulli(drop).unsqueeze(-1)
+                # d = mask * distributions
 
                 if joint_type == 'predictions':
-                    preds = preds * distributions
-                    f_hat = preds.mean(0)
 
+                    # a = torch.quantile(distributions, 0.75, 1, keepdim=True)
+                    # b = (distributions >= a).float() * distributions
+                    # distributions = b
+
+                    preds = preds * d
+                    f_hat = torch.amax(preds, 1)
+                    # f_hat = torch.mean(preds, 1)
+
+                    # a = torch.topk(distributions, 2, 0)
+                    # preds = torch.gather(preds, 0, a[1])
+                    #
+                    # f_hat = torch.mean(preds, 0)
+
+                    # preds = preds * distributions
+
+                    # output = cos(preds, preds)
+
+                    # distances = []
+
+                    # drop = torch.full(preds.shape, 0.25,
+                    #                   device=device)
+                    # drop = torch.full(preds.shape, 0.25,
+                    #                   device=device)
+                    #
+                    # mask = torch.bernoulli(drop)
+                    # preds = mask * preds
+
+                    # f_hat = torch.max(preds, 0)[0]
+                    # f_hat = torch.amax(preds, 0)
+
+                    # f_hat = preds.sum(0)
+
+                    # for i in range(len(preds)):
+                    #     d = 0
+                    #     for j in range(i, len(preds)):
+                    #         similarity = torch.cosine_similarity(
+                    #             preds[i].view(1, -1),
+                    #             preds[j].view(1, -1)) ** 2
+                    #         d += similarity
+                    #
+                    #     d = d / (len(preds) - i)
+                    #     distances.append(d)
+                    #
+                    # distances = torch.cat(distances)
+
+                    # f_hat = preds.mean(0)
                     loss = nn.functional.cross_entropy(f_hat, y,
                                                        reduction='mean')
 
+                    # loss += distances.mean()
+
                 else:
+
                     loss = torch.stack(
-                        [nn.functional.cross_entropy(p, y, reduction='none')
-                         for p in preds], 0)
+                        [nn.functional.cross_entropy(preds[:, p], y,
+                                                     reduction='none')
+                         for p in range(preds.shape[1])], 1)
 
                     distributions = distributions.squeeze(-1)
 
                     loss = loss * distributions
-                    loss = loss.mean(1)
-                    loss = loss.sum()
+                    loss = loss.sum(1)
+                    loss = loss.mean()
 
             losses.append(loss.item())
 
@@ -440,6 +544,18 @@ def binary_bernulli_trainer(model: BranchModel,
                           predictors=predictors)
         s = dict(s)
         print(s)
+
+        for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8]:
+            a, b = binary_eval(model=model,
+                               dataset_loader=test_loader,
+                               predictors=predictors,
+                               epsilon=epsilon,
+                               cumulative_threshold=True)
+
+            a, b = dict(a), dict(b)
+
+            print('Epsilon {} scores: {}, {}'.format(epsilon,
+                                                        dict(a), dict(b)))
 
         mean_kl_loss = np.mean(kl_losses)
         mean_losses.append(mean_loss)

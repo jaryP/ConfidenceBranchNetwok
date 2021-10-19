@@ -138,7 +138,7 @@ def my_app(cfg: DictConfig) -> None:
                                           classes=classes,
                                           get_binaries=get_binaries)
 
-        if os.path.exists(os.path.join(experiment_path, 'bb.pt')):
+        if os.path.exists(os.path.join(experiment_path, 'bb.pt')) and load:
             log.info('Model loaded')
 
             backbone.to(device)
@@ -387,10 +387,11 @@ def my_app(cfg: DictConfig) -> None:
             #     # connect_to_last=connect_to_last)
             #
 
-            torch.save(backbone.state_dict(), os.path.join(experiment_path,
-                                                           'bb.pt'))
-            torch.save(classifiers.state_dict(), os.path.join(experiment_path,
-                                                              'classifiers.pt'))
+            if save:
+                torch.save(backbone.state_dict(), os.path.join(experiment_path,
+                                                               'bb.pt'))
+                torch.save(classifiers.state_dict(), os.path.join(experiment_path,
+                                                                  'classifiers.pt'))
 
         results = {}
 
@@ -423,7 +424,7 @@ def my_app(cfg: DictConfig) -> None:
 
             cumulative_threshold_scores = {}
 
-            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8]:
+            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
@@ -441,14 +442,14 @@ def my_app(cfg: DictConfig) -> None:
             results['cumulative_results'] = cumulative_threshold_scores
 
             binary_threshold_scores = {}
-            for epsilon in [.2, .4, .5, .6, .7, .8]:
+            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
-                                   epsilon=[0.6] +
+                                   epsilon=
                                            [epsilon] *
                                            (
-                                                   backbone.n_branches() - 1))
+                                                   backbone.n_branches()))
 
                 a, b = dict(a), dict(b)
 

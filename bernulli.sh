@@ -8,7 +8,7 @@ case $DATASET in
   cifar10)
   case $MODEL in
   alexnet)
-    python main.py +dataset=cifar10 +method=bernulli2 experiment=base +model=alexnet optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/alexnet/bernulli2' training.device="$DEVICE"
+    python main.py +dataset=cifar10 +method=bernulli2 experiment=base +model=alexnet optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/alexnet/bernulli2_new' training.device="$DEVICE"
     python main.py +dataset=cifar10 +method=bernulli experiment=base +model=alexnet optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/alexnet/bernulli' training.device="$DEVICE"
     python main.py +dataset=cifar10 +method=bernulli1 experiment=base +model=alexnet optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/alexnet/bernulli1' training.device="$DEVICE"
   #  python main.py +dataset=cifar10 +method=joint experiment=base +model=resnet20 optimizer=sgd_momentum +training=cifar10 hydra.run.dir='./outputs/cifar10/joint' training.device="$DEVICE"
