@@ -125,7 +125,6 @@ def my_app(cfg: DictConfig) -> None:
             # logger.info(
             #     'Eval dataset created, having size: {}'.format(len(eval)))
 
-
         trainloader = torch.utils.data.DataLoader(train_set,
                                                   batch_size=batch_size,
                                                   shuffle=True)
@@ -134,9 +133,15 @@ def my_app(cfg: DictConfig) -> None:
                                                  batch_size=batch_size,
                                                  shuffle=False)
 
+        if get_binaries:
+            fix_last_layer = method_cfg.get('fix_last_layer', False)
+        else:
+            fix_last_layer = False
+
         backbone, classifiers = get_model(model_name, image_size=input_size,
                                           classes=classes,
-                                          get_binaries=get_binaries)
+                                          get_binaries=get_binaries,
+                                          fix_last_layer=fix_last_layer)
 
         if os.path.exists(os.path.join(experiment_path, 'bb.pt')) and load:
             log.info('Model loaded')
@@ -171,7 +176,7 @@ def my_app(cfg: DictConfig) -> None:
                     model_name,
                     image_size=input_size,
                     classes=classes,
-                    get_binaries=get_binaries)
+                    get_binaries=False)
 
                 if os.path.exists(pre_trained_model_path) and \
                         os.path.exists(pre_trained_classifier_path):
@@ -180,9 +185,9 @@ def my_app(cfg: DictConfig) -> None:
                     pretrained_backbone.load_state_dict(
                         torch.load(pre_trained_model_path,
                                    map_location=device))
-                    pretrained_classifiers.load_state_dict(
-                        torch.load(pre_trained_classifier_path,
-                                   map_location=device))
+                    # pretrained_classifiers.load_state_dict(
+                    #     torch.load(pre_trained_classifier_path,
+                    #                map_location=device))
                 else:
 
                     os.makedirs(pre_trained_path, exist_ok=True)
@@ -265,7 +270,13 @@ def my_app(cfg: DictConfig) -> None:
                 joint_type = method_cfg.get('joint_type', 'predictions')
                 prior_w = method_cfg.get('prior_w', 1e-3)
                 sample = method_cfg.get('sample', True)
+
                 recursive = method_cfg.get('recursive', False)
+                normalize_weights = method_cfg.get('normalize_weights', False)
+                calibrate = method_cfg.get('calibrate', False)
+                prior_mode = method_cfg.get('prior_mode', 'ones')
+                regularization_loss = method_cfg.get('regularization_loss',
+                                                     'bce')
 
                 res = binary_bernulli_trainer(model=backbone,
                                               predictors=classifiers,
@@ -277,10 +288,17 @@ def my_app(cfg: DictConfig) -> None:
                                               joint_type=joint_type,
                                               prior_w=prior_w,
                                               sample=sample,
+                                              prior_mode=prior_mode,
                                               eval_loader=eval_loader,
                                               recursive=recursive,
                                               test_loader=testloader,
-                                              fixed_bernulli=fixed_bernulli)[0]
+                                              fixed_bernulli=fixed_bernulli,
+                                              fix_last_layer=fix_last_layer,
+                                              normalize_weights=
+                                              normalize_weights,
+                                              calibrate=calibrate,
+                                              regularization_loss=
+                                              regularization_loss)[0]
 
                 backbone_dict, classifiers_dict = res
 

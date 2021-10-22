@@ -339,15 +339,15 @@ def binary_eval(model: BranchModel,
                     found = True
                     break
 
-                # if not found:
-                #     i = len(predictors) - 1
-                #     p = logits[i][bi]
-                #
-                #     exits_counter[i] += 1
-                #     pred = torch.argmax(p)
-                #
-                #     if pred == y[bi]:
-                #         exits_corrected[i] += 1
+            if not found:
+                i = len(predictors) - 1
+                p = logits[i][bi]
+
+                exits_counter[i] += 1
+                pred = torch.argmax(p)
+
+                if pred == y[bi]:
+                    exits_corrected[i] += 1
 
                 # for i in range(len(binary_classifiers)):
                 #     logits = preds[i][bi].unsqueeze(0)

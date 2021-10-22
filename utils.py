@@ -17,7 +17,9 @@ def get_device(model: nn.Module):
 def get_intermediate_classifiers(model,
                                  image_size,
                                  num_classes,
-                                 binary_branch=False):
+                                 binary_branch=False,
+                                 fix_last_layer=False):
+
     predictors = nn.ModuleList()
     x = torch.randn((1,) + image_size)
     outputs = model(x)
@@ -32,21 +34,19 @@ def get_intermediate_classifiers(model,
                                             nn.Linear(od, num_classes)])
 
             if binary_branch:
-                # b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
-                #                              classifier=linear_layers,
-                #                              constant_binary_output=1.0)
-                # BinaryIntermediateBranch(preprocessing=seq,
-                #                          classifier=linear_layers,
-                #                          binary_classifier=binary_layers)
+                if fix_last_layer:
+                    b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
+                                                 classifier=linear_layers,
+                                                 constant_binary_output=1.0)
+                else:
+                    binary_layers = nn.Sequential(*[nn.ReLU(),
+                                                    nn.Linear(od, 1),
+                                                    nn.Sigmoid()
+                                                    ])
 
-                binary_layers = nn.Sequential(*[nn.ReLU(),
-                                                nn.Linear(od, 1),
-                                                nn.Sigmoid()
-                                                ])
-
-                b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
-                                             classifier=linear_layers,
-                                             binary_classifier=binary_layers)
+                    b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
+                                                 classifier=linear_layers,
+                                                 binary_classifier=binary_layers)
             else:
                 b = IntermediateBranch(preprocessing=nn.Flatten(),
                                        classifier=linear_layers)
@@ -114,7 +114,8 @@ def get_intermediate_classifiers(model,
     return predictors
 
 
-def get_model(name, image_size, classes, get_binaries=False):
+def get_model(name, image_size, classes, get_binaries=False,
+              fix_last_layer=False):
     name = name.lower()
     if name == 'alexnet':
         model = AlexNet(image_size[0])
@@ -129,7 +130,8 @@ def get_model(name, image_size, classes, get_binaries=False):
     classifiers = get_intermediate_classifiers(model,
                                                image_size,
                                                classes,
-                                               binary_branch=get_binaries)
+                                               binary_branch=get_binaries,
+                                               fix_last_layer=fix_last_layer)
 
     return model, classifiers
 

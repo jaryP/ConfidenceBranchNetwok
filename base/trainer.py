@@ -264,11 +264,21 @@ def binary_bernulli_trainer(model: BranchModel,
                             early_stopping=None,
                             test_loader=None,
                             eval_loader=None,
-                            recursive=False):
-
+                            recursive=False,
+                            fix_last_layer=False,
+                            normalize_weights=True,
+                            prior_mode='ones',
+                            regularization_loss='bce',
+                            calibrate=False):
     device = get_device(model)
 
     if joint_type not in ['losses', 'predictions']:
+        raise ValueError
+
+    if prior_mode not in ['entropy', 'ones', 'probability']:
+        raise ValueError
+
+    if regularization_loss not in ['kl', 'bce']:
         raise ValueError
 
     if isinstance(prior_parameters, (float, int)):
@@ -330,26 +340,51 @@ def binary_bernulli_trainer(model: BranchModel,
                     mx = torch.argmax(preds, -1)
                     a = (mx == _y).float()
 
-                    if True:
+                    # if calibrate:
+                    #     sf = torch.softmax(preds, -1)
+                    #     mx, _ = torch.max(sf, -1)
+                    #     a = a * mx
+
+                    if prior_mode == 'probability':
                         sf = torch.softmax(preds, -1)
                         mx, _ = torch.max(sf, -1)
                         a = a * mx
+
+                    elif prior_mode == 'entropy':
+                        sf = torch.softmax(preds, -1)
+                        h = -(sf + 1e-12).log() * sf
+                        # print(bi, i, h.sum())
+                        h = h / np.log(sf.shape[-1])
+                        h = h.sum(-1)
+                        a = a * (1 - h)
 
                     # ones = torch.zeros_like(a)
                     # ones[:, -1] = 1
                     # a = torch.maximum(a, ones)
 
+                    # a = a[:, :-1]
                     a = a.unsqueeze(-1)
 
-                bce = nn.functional.binary_cross_entropy(
-                    distributions, a, reduction='none')
+                    if fix_last_layer:
+                        a[:, -1] = 1
+                    # d = distributions[:, :-1]
+                # else:
+                #     d = distributions
 
-                kl = bce.sum(-1)
+                # bce = nn.functional.binary_cross_entropy(
+                #     distributions[:, :-1], a, reduction='none')
+                if regularization_loss == 'bce':
+                    bce = nn.functional.binary_cross_entropy(distributions, a,
+                                                             reduction='none')
+                    kl = bce.sum([-1])
 
-                # a = torch.maximum(a, prior_stack)
-                # d = ContinuousBernoulli(distributions)
-                # p = ContinuousBernoulli(a)
-                # kl = kl_divergence(d, p).sum(1)
+                elif regularization_loss == 'kl':
+                    # kl = bce.sum([-1, -2])
+
+                    # a = torch.maximum(a, prior_stack)
+                    d = ContinuousBernoulli(distributions)
+                    p = ContinuousBernoulli(a)
+                    kl = kl_divergence(d, p).sum(1)
 
                 # d = ContinuousBernoulli(torch.stack(distributions, 1)
                 #                         .squeeze(-1))
@@ -369,13 +404,15 @@ def binary_bernulli_trainer(model: BranchModel,
 
                 kl_losses.append(kl.item())
 
-                # klw = 2 ** (len(train_loader) - bi - 1) / \
-                #       (2 ** len(train_loader) - 1)
-                #
+                klw = 2 ** (len(train_loader) - bi - 1) / \
+                      (2 ** len(train_loader) - 1)
+
                 # # klw = 2 ** (epochs - epoch - 1) \
                 # #       / (2 ** epochs - 1)
                 # #
-                # kl *= klw
+                #
+                #
+                kl *= (1 - klw)
 
                 # if sample:
                 #     distributions = [ContinuousBernoulli(d).rsample()
@@ -411,10 +448,21 @@ def binary_bernulli_trainer(model: BranchModel,
                                                    reduction='mean')
 
             else:
-                distributions[:, 1:, :] *= torch.cumprod(
-                    1 - distributions[:, :-1, :], 1)
+                # distributions[:, 1:, :] = distributions[:, 1:,
+                #                           :] * torch.cumprod(
+                #     1 - distributions[:, :-1, :], 1)
 
-                d = distributions
+                if normalize_weights:
+                    a, _ = torch.split(distributions,
+                                       [1, distributions.shape[1] - 1],
+                                       dim=1)
+                    c = torch.cumprod(1 - distributions[:, :-1, :], 1)
+                    distributions = torch.cat((a, c), 1)
+
+                # torch.stack((d[:, 1, :], d[:, 1:, :]))
+                #
+                # d[:, 1:, :] = d[:, 1:, :] * torch.cumprod(1 - d[:, :-1, :], 1)
+
                 # d[:, 1:] *= torch.cumprod(1 - d[:, :-1], 1)
 
                 # distributions = distributions[:, 1:, :] * \
@@ -432,48 +480,10 @@ def binary_bernulli_trainer(model: BranchModel,
                     # b = (distributions >= a).float() * distributions
                     # distributions = b
 
-                    preds = preds * d
-                    f_hat = torch.amax(preds, 1)
-                    # f_hat = torch.mean(preds, 1)
+                    preds = preds * distributions
+                    # f_hat = torch.amax(preds, 1)
+                    f_hat = torch.mean(preds, 1)
 
-                    # a = torch.topk(distributions, 2, 0)
-                    # preds = torch.gather(preds, 0, a[1])
-                    #
-                    # f_hat = torch.mean(preds, 0)
-
-                    # preds = preds * distributions
-
-                    # output = cos(preds, preds)
-
-                    # distances = []
-
-                    # drop = torch.full(preds.shape, 0.25,
-                    #                   device=device)
-                    # drop = torch.full(preds.shape, 0.25,
-                    #                   device=device)
-                    #
-                    # mask = torch.bernoulli(drop)
-                    # preds = mask * preds
-
-                    # f_hat = torch.max(preds, 0)[0]
-                    # f_hat = torch.amax(preds, 0)
-
-                    # f_hat = preds.sum(0)
-
-                    # for i in range(len(preds)):
-                    #     d = 0
-                    #     for j in range(i, len(preds)):
-                    #         similarity = torch.cosine_similarity(
-                    #             preds[i].view(1, -1),
-                    #             preds[j].view(1, -1)) ** 2
-                    #         d += similarity
-                    #
-                    #     d = d / (len(preds) - i)
-                    #     distances.append(d)
-                    #
-                    # distances = torch.cat(distances)
-
-                    # f_hat = preds.mean(0)
                     loss = nn.functional.cross_entropy(f_hat, y,
                                                        reduction='mean')
 
@@ -555,7 +565,7 @@ def binary_bernulli_trainer(model: BranchModel,
             a, b = dict(a), dict(b)
 
             print('Epsilon {} scores: {}, {}'.format(epsilon,
-                                                        dict(a), dict(b)))
+                                                     dict(a), dict(b)))
 
         mean_kl_loss = np.mean(kl_losses)
         mean_losses.append(mean_loss)
