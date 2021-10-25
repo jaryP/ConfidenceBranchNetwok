@@ -30,24 +30,36 @@ def get_intermediate_classifiers(model,
         if i == (len(outputs) - 1):
             od = torch.flatten(o, 1).shape[-1]
 
-            linear_layers = nn.Sequential(*[nn.ReLU(),
-                                            nn.Linear(od, num_classes)])
-
             if binary_branch:
                 if fix_last_layer:
-                    b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
-                                                 classifier=linear_layers,
-                                                 constant_binary_output=1.0)
-                else:
-                    binary_layers = nn.Sequential(*[nn.ReLU(),
-                                                    nn.Linear(od, 1),
-                                                    nn.Sigmoid()
-                                                    ])
+                    linear_layers = nn.Sequential(*[nn.ReLU(),
+                                                    nn.Linear(od, num_classes)])
 
                     b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                                  classifier=linear_layers,
-                                                 binary_classifier=binary_layers)
+                                                 # constant_binary_output=1.0,
+                                                 return_one=True)
+                else:
+                    linear_layers = nn.Sequential(*[nn.ReLU(),
+                                                    nn.Linear(od,
+                                                              num_classes + 1)])
+
+                    # binary_layers = nn.Sequential(*[nn.ReLU(),
+                    #                                 nn.Linear(num_classes,
+                    #                                           num_classes),
+                    #                                 nn.ReLU(),
+                    #                                 nn.Linear(num_classes, 1),
+                    #                                 nn.Sigmoid()
+                    #                                 ])
+                    #
+                    b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
+                                                 classifier=linear_layers,
+                                                 # binary_classifier=binary_layers
+                                                 )
             else:
+                linear_layers = nn.Sequential(*[nn.ReLU(),
+                                                nn.Linear(od, num_classes)])
+
                 b = IntermediateBranch(preprocessing=nn.Flatten(),
                                        classifier=linear_layers)
 
@@ -85,28 +97,32 @@ def get_intermediate_classifiers(model,
             #                         nn.ReLU())
 
             seq.add_module('flatten', nn.Flatten())
-            # print(o.shape)
 
             output = seq(o)
             output = torch.flatten(output, 1)
             od = output.shape[-1]
 
-            linear_layers = nn.Sequential(*[nn.ReLU(),
-                                            nn.Linear(od, num_classes)])
-
             if binary_branch:
+                linear_layers = nn.Sequential(*[nn.ReLU(),
+                                                nn.Linear(od, num_classes + 1)])
 
-                binary_layers = nn.Sequential(*[nn.ReLU(),
-                                                nn.Linear(od, 1),
-                                                nn.Sigmoid()
-                                                ])
+                # binary_layers = nn.Sequential(*[nn.ReLU(),
+                #                                 nn.Linear(num_classes, num_classes),
+                #                                 nn.ReLU(),
+                #                                 nn.Linear(num_classes, 1),
+                #                                 nn.Sigmoid()
+                #                                 ])
 
                 predictors.append(
                     BinaryIntermediateBranch(preprocessing=seq,
                                              classifier=linear_layers,
-                                             binary_classifier=binary_layers))
+                                             # binary_classifier=binary_layers
+                                             ))
 
             else:
+                linear_layers = nn.Sequential(*[nn.ReLU(),
+                                                nn.Linear(od, num_classes)])
+
                 predictors.append(IntermediateBranch(preprocessing=seq,
                                                      classifier=linear_layers))
             predictors[-1](o)

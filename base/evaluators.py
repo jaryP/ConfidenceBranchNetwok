@@ -240,7 +240,8 @@ def binary_eval(model: BranchModel,
                 predictors: nn.ModuleList,
                 dataset_loader,
                 epsilon: Union[List[float], float] = None,
-                cumulative_threshold=False):
+                cumulative_threshold=False,
+                sample=False):
     model.eval()
     predictors.eval()
     # binary_classifiers.eval()
@@ -273,6 +274,8 @@ def binary_eval(model: BranchModel,
             logits.append(l)
 
         distributions = torch.stack(distributions, 0)
+        if sample:
+            distributions = ContinuousBernoulli(distributions).rsample()
 
         logits = torch.stack(logits, 0)
 
@@ -412,3 +415,49 @@ def binary_eval(model: BranchModel,
 
     return branches_scores, exits_counter
 
+
+@torch.no_grad()
+def binary_statistics(model: BranchModel,
+                      predictors: nn.ModuleList,
+                      dataset_loader):
+
+    model.eval()
+    predictors.eval()
+    device = get_device(model)
+
+    correct = defaultdict(list)
+    incorrect = defaultdict(list)
+
+    for i in range(len(predictors)):
+        predictor = predictors[i]
+
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+
+            pred = model(x)[i]
+
+            pred, hs = predictor(pred)
+            pred = torch.argmax(pred, 1)
+
+            for p, h, y in zip(pred, hs, y):
+                h = h.item()
+                if y == p:
+                    correct[i].append(h)
+                else:
+                    incorrect[i].append(h)
+
+    correct_results = {}
+    incorrect_results = {}
+
+    for i in range(len(predictors)):
+        mn = np.mean(correct[i])
+        std = np.std(correct[i])
+
+        correct_results[i] = {'mean': mn, 'std': std}
+
+        mn = np.mean(incorrect[i])
+        std = np.std(incorrect[i])
+
+        incorrect_results[i] = {'mean': mn, 'std': std}
+
+    return correct_results, incorrect_results

@@ -112,7 +112,8 @@ def my_app(cfg: DictConfig) -> None:
             train_len = train_len - eval_len
 
             train_set, eval = torch.utils.data.random_split(train_set,
-                                                        [train_len, eval_len])
+                                                            [train_len,
+                                                             eval_len])
             # train_loader = torch.utils.data.DataLoader(dataset=train,
             #                                            batch_size=batch_size,
             #                                            shuffle=True)
@@ -408,8 +409,9 @@ def my_app(cfg: DictConfig) -> None:
             if save:
                 torch.save(backbone.state_dict(), os.path.join(experiment_path,
                                                                'bb.pt'))
-                torch.save(classifiers.state_dict(), os.path.join(experiment_path,
-                                                                  'classifiers.pt'))
+                torch.save(classifiers.state_dict(),
+                           os.path.join(experiment_path,
+                                        'classifiers.pt'))
 
         results = {}
 
@@ -446,13 +448,24 @@ def my_app(cfg: DictConfig) -> None:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
-                                   epsilon=epsilon,
-                                   cumulative_threshold=True)
+                                   epsilon=[0.7 if epsilon <= 0.7 else epsilon] +
+                                           [epsilon] *
+                                           (backbone.n_branches() - 1),
+                                   cumulative_threshold=True,
+                                   sample=False)
 
                 a, b = dict(a), dict(b)
 
-                log.info('Epsilon {} scores: {}, {}'.format(epsilon,
-                                                            dict(a), dict(b)))
+                # log.info('Epsilon {} scores: {}, {}'.format(epsilon,
+                #                                             dict(a), dict(b)))
+
+                s = '\tCumulative binary {}. '.format(epsilon)
+                for k in sorted([k for k in a.keys() if k != 'global']):
+                    s += 'Branch {}, score: {}, counter: {}. '.format(k,
+                                                                      a[k],
+                                                                      b[k])
+                s += 'Global score: {}'.format(a['global'])
+                log.info(s)
 
                 cumulative_threshold_scores[epsilon] = {'scores': a,
                                                         'counters': b}
@@ -464,14 +477,21 @@ def my_app(cfg: DictConfig) -> None:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
-                                   epsilon=
+                                   epsilon=[0.7 if epsilon <= 0.7 else epsilon] +
                                            [epsilon] *
-                                           (
-                                                   backbone.n_branches()))
+                                           (backbone.n_branches() - 1))
 
                 a, b = dict(a), dict(b)
 
-                log.info('Threshold {} scores: {}, {}'.format(epsilon, a, b))
+                # log.info('Threshold {} scores: {}, {}'.format(epsilon, a, b))
+
+                s = '\tThreshold {}. '.format(epsilon)
+                for k in sorted([k for k in a.keys() if k != 'global']):
+                    s += 'Branch {}, score: {}, counter: {}. '.format(k,
+                                                                      a[k],
+                                                                      b[k])
+                s += 'Global score: {}'.format(a['global'])
+                log.info(s)
 
                 binary_threshold_scores[epsilon] = {'scores': a,
                                                     'counters': b}
@@ -489,9 +509,18 @@ def my_app(cfg: DictConfig) -> None:
                                     threshold=entropy_threshold)
                 a, b = dict(a), dict(b)
 
-                log.info(
-                    'Entropy Threshold {} scores: {}, {}'.format(
-                        entropy_threshold, a, b))
+                # log.info(
+                #     'Entropy Threshold {} scores: {}, {}'.format(
+                #         entropy_threshold, a, b))
+
+                s = '\tEntropy Threshold {}. '.format(entropy_threshold)
+
+                for k in sorted([k for k in a.keys() if k != 'global']):
+                    s += 'Branch {}, score: {}, counter: {}. '.format(k,
+                                                                      a[k],
+                                                                      b[k])
+                s += 'Global score: {}'.format(a['global'])
+                log.info(s)
 
                 entropy_threshold_scores[entropy_threshold] = {'scores': a,
                                                                'counters': b}
