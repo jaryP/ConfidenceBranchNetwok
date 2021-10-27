@@ -44,6 +44,9 @@ def get_intermediate_classifiers(model,
                                                     nn.Linear(od,
                                                               num_classes + 1)])
 
+                    bias = linear_layers[-1].bias.data
+                    bias[-1] = 10
+                    # linear_layers[-1].bias.data = bias
                     # binary_layers = nn.Sequential(*[nn.ReLU(),
                     #                                 nn.Linear(num_classes,
                     #                                           num_classes),
@@ -105,7 +108,9 @@ def get_intermediate_classifiers(model,
             if binary_branch:
                 linear_layers = nn.Sequential(*[nn.ReLU(),
                                                 nn.Linear(od, num_classes + 1)])
-
+                bias = linear_layers[-1].bias.data
+                bias[-1] = 10
+                # linear_layers[-1].bias.data = bias
                 # binary_layers = nn.Sequential(*[nn.ReLU(),
                 #                                 nn.Linear(num_classes, num_classes),
                 #                                 nn.ReLU(),
@@ -267,32 +272,32 @@ def get_dataset(name, model_name, augmentation=False):
 
         input_size, classes = (3, 32, 32), 10
 
-    # elif name == 'cifar100':
-    #     tt = [
-    #         RandomCrop(32, padding=4),
-    #         RandomHorizontalFlip(),
-    #         ToTensor(),
-    #         Normalize((0.4914, 0.4822, 0.4465),
-    #                              (0.2023, 0.1994, 0.2010))]
-    #
-    #     t = [
-    #         ToTensor(),
-    #         Normalize((0.4914, 0.4822, 0.4465),
-    #                              (0.2023, 0.1994, 0.2010))]
-    #
-    #     transform = Compose(t)
-    #     train_transform = Compose(tt)
-    #
-    #     train_set = datasets.CIFAR100(
-    #         root='~/loss_landscape_dataset/cifar100', train=True, download=True,
-    #         transform=train_transform)
-    #
-    #     test_set = datasets.CIFAR100(
-    #         root='~/loss_landscape_dataset/cifar100', train=False, download=True,
-    #         transform=transform)
-    #
-    #     input_size, classes = 3, 100
-    #
+    elif name == 'cifar100':
+        tt = [
+            RandomCrop(32, padding=4),
+            RandomHorizontalFlip(),
+            ToTensor(),
+            Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010))]
+
+        t = [
+            ToTensor(),
+            Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010))]
+
+        transform = Compose(t)
+        train_transform = Compose(tt)
+
+        train_set = datasets.CIFAR100(
+            root='~/datasets/cifar100', train=True, download=True,
+            transform=train_transform)
+
+        test_set = datasets.CIFAR100(
+            root='~/datasets/cifar100', train=False, download=True,
+            transform=transform)
+
+        input_size, classes = (3, 32, 32), 100
+
     # elif name == 'tinyimagenet':
     #     tt = [
     #         ToTensor(),

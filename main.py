@@ -152,9 +152,17 @@ def my_app(cfg: DictConfig) -> None:
 
             backbone.load_state_dict(torch.load(
                 os.path.join(experiment_path, 'bb.pt'), map_location=device))
-            classifiers.load_state_dict(torch.load(
-                os.path.join(experiment_path, 'classifiers.pt'),
-                map_location=device))
+
+            loaded_state_dict = torch.load(os.path.join(
+                experiment_path, 'classifiers.pt'), map_location=device)
+
+            # old code compatibility
+            loaded_state_dict = {k: v for k, v in
+                                 loaded_state_dict.items()
+                                 if 'binary_classifier' not in k}
+
+            classifiers.load_state_dict(loaded_state_dict)
+
         else:
             if method_cfg.get('pre_trained', False):
                 pre_trained_path = os.path.join('~/branch_models/',
@@ -186,9 +194,9 @@ def my_app(cfg: DictConfig) -> None:
                     pretrained_backbone.load_state_dict(
                         torch.load(pre_trained_model_path,
                                    map_location=device))
-                    # pretrained_classifiers.load_state_dict(
-                    #     torch.load(pre_trained_classifier_path,
-                    #                map_location=device))
+                    pretrained_classifiers.load_state_dict(
+                        torch.load(pre_trained_classifier_path,
+                                   map_location=device))
                 else:
 
                     os.makedirs(pre_trained_path, exist_ok=True)
@@ -233,15 +241,15 @@ def my_app(cfg: DictConfig) -> None:
                 #                              dataset_loader=trainloader,
                 #                              classifier=pretrained_classifiers[
                 #                                  -1])
-                #
-                # test_scores = standard_eval(model=pretrained_backbone,
-                #                             dataset_loader=testloader,
-                #                             classifier=pretrained_classifiers[
-                #                                 -1])
-                #
-                # log.info('Pre trained model scores : {}, {}'.format(
-                #     train_scores,
-                #     test_scores))
+
+                test_scores = standard_eval(model=pretrained_backbone,
+                                            dataset_loader=testloader,
+                                            classifier=pretrained_classifiers[
+                                                -1])
+
+                log.info('Pre trained model scores : {}, {}'.format(
+                    -1,
+                    test_scores))
 
                 backbone.load_state_dict(pretrained_backbone.state_dict())
 
@@ -363,49 +371,6 @@ def my_app(cfg: DictConfig) -> None:
             else:
                 assert False
 
-            # elif method_name == 'joint':
-            #     pass
-
-            #     if logits_training:
-            #         backbone, classifiers = dirichlet_logits_model_train(
-            #             backbone=backbone,
-            #             classifiers=classifiers,
-            #             trainloader=trainloader,
-            #             testloader=testloader,
-            #             optimizer=optimizer,
-            #             distance_regularization=distance_regularization,
-            #             distance_weight=distance_weight,
-            #             similarity=similarity,
-            #             epochs=epochs,
-            #             anneal_dirichlet=anneal_dirichlet,
-            #             ensemble_dropout=ensemble_dropout,
-            #             test_samples=test_samples,
-            #             device=device)
-            #     else:
-            #         backbone, classifiers = dirichlet_model_train(
-            #             backbone=backbone,
-            #             classifiers=classifiers,
-            #             trainloader=trainloader,
-            #             testloader=testloader,
-            #             optimizer=optimizer,
-            #             distance_regularization=distance_regularization,
-            #             distance_weight=distance_weight,
-            #             similarity=similarity,
-            #             epochs=epochs,
-            #             anneal_dirichlet=anneal_dirichlet,
-            #             ensemble_dropout=ensemble_dropout,
-            #             test_samples=test_samples,
-            #             device=device)
-            #
-            #     # criterion=criterion,
-            #     # past_models=past_models,
-            #     # distance_regularization=distance_regularization,
-            #     # distance_weight=distance_weight,
-            #     # cosine_distance=cosine_distance,
-            #     # mode_connectivity=mode_connectivity,
-            #     # connect_to_last=connect_to_last)
-            #
-
             if save:
                 torch.save(backbone.state_dict(), os.path.join(experiment_path,
                                                                'bb.pt'))
@@ -444,11 +409,12 @@ def my_app(cfg: DictConfig) -> None:
 
             cumulative_threshold_scores = {}
 
-            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
+            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
-                                   epsilon=[0.7 if epsilon <= 0.7 else epsilon] +
+                                   epsilon=[
+                                               0.7 if epsilon <= 0.7 else epsilon] +
                                            [epsilon] *
                                            (backbone.n_branches() - 1),
                                    cumulative_threshold=True,
@@ -473,11 +439,12 @@ def my_app(cfg: DictConfig) -> None:
             results['cumulative_results'] = cumulative_threshold_scores
 
             binary_threshold_scores = {}
-            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
+            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
-                                   epsilon=[0.7 if epsilon <= 0.7 else epsilon] +
+                                   epsilon=[
+                                               0.7 if epsilon <= 0.7 else epsilon] +
                                            [epsilon] *
                                            (backbone.n_branches() - 1))
 

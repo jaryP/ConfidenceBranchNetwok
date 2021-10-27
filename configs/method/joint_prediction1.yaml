@@ -1,7 +1,0 @@
-weights:
-  - 1
-  - 1
-  - 1
-name: joint
-pre_trained: true
-joint_type: predictions

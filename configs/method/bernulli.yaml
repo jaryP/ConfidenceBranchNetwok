@@ -1,11 +1,9 @@
 name: bernulli
-priors:
-  - 0.8
-  - 0.6
-  - 0.5
-  - 0.4
-  - 1
-prior_w: 0.1
-joint_type: predictions
+prior_w: 1
+joint_type: losses
 sample: true
 pre_trained: true
+method.regularization_loss: bce
+method.prior_mode: ones
+fix_last_layer: false
+normalize_weights: false
