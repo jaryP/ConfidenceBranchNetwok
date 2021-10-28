@@ -2,9 +2,7 @@ import json
 import os
 import re
 
-import hydra
 import numpy as np
-from omegaconf import DictConfig
 import matplotlib.pyplot as plt
 import sys
 from matplotlib.pyplot import cm
@@ -91,8 +89,8 @@ def plot_heatmap(results: dict, branches=5):
 
     matrix_counters /= tot
 
-    fig1, ax1 = plt.subplots()
-    fig2, ax2 = plt.subplots()
+    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    fig2, ax2 = plt.subplots(figsize=(12, 8))
 
     matrix_scores = np.around(matrix_scores * 100, 1)
     matrix_counters = np.around(matrix_counters * 100, 1)
@@ -130,6 +128,69 @@ def plot_heatmap(results: dict, branches=5):
     return fig1, fig2
 
 
+def plot_lines(results: dict, branches=5):
+    keys = sorted(map(float, results.keys()))
+    # colors = ['b', 'g', 'r', 'c', 'm', 'k']
+    # legend = set()
+
+    matrix_scores = np.zeros((len(keys), branches + 1))
+    matrix_counters = np.zeros((len(keys), branches))
+
+    for i, k in enumerate(keys):
+        k = str(k)
+        r = results[k]
+
+        scores = r['scores']
+        counters = r['counters']
+        tot = sum(counters.values())
+
+        for j in range(branches):
+            kj = str(j)
+
+            matrix_scores[i][j] = scores.get(kj, 0)
+            matrix_counters[i][j] = counters.get(kj, 0)
+
+        matrix_scores[i][-1] = scores['global']
+
+    tot = matrix_counters.sum(1)[0]
+
+    matrix_counters /= tot
+
+    fig1, ax1 = plt.subplots()
+    fig2, ax2 = plt.subplots()
+
+    matrix_scores = np.around(matrix_scores * 100, 1)
+    matrix_counters = np.around(matrix_counters * 100, 1)
+
+    for i in range(matrix_scores.shape[1]):
+        p = matrix_scores[:, i]
+        label = 'Branch {}'.format(i + 1) if i != matrix_scores.shape[1] - 1 \
+            else 'Global Accuracy'
+        ax1.plot(p, label=label)
+
+    for i in range(matrix_counters.shape[1]):
+        p = matrix_counters[:, i]
+        label = 'Branch {}'.format(i + 1)
+        ax2.plot(p, label=label)
+
+    ax1.set_xticklabels([''] + keys)
+    ax2.set_xticklabels([''] + keys)
+
+    ax1.grid(alpha=0.5)
+    ax2.grid(alpha=0.5)
+
+    ax1.legend()
+    ax2.legend()
+
+    ax1.set_ylabel('Accuracy (%)')
+    ax1.set_xlabel('Threshold')
+
+    ax2.set_ylabel('Counters (%)')
+    ax2.set_xlabel('Threshold')
+
+    return fig1, fig2
+
+
 def my_app() -> None:
     paths = sys.argv[1:]
 
@@ -156,16 +217,26 @@ def my_app() -> None:
                                                     branches=branches)
                     binary_scores_fig.savefig(os.path.join(
                         plot_dirs, 'binary_results.pdf'),
-                    bbox_inches='tight')
+                        bbox_inches=None)
+
+                    f1, f2 = plot_lines(results['binary_results'],
+                               branches=branches)
+
+                    f1.savefig(os.path.join(plot_dirs,
+                                            'lines_binary_results_hm_scores.pdf'),
+                               bbox_inches=None)
+                    f2.savefig(os.path.join(plot_dirs,
+                                            'lines_binary_results_hm_counters.pdf'),
+                               bbox_inches=None)
 
                     f1, f2 = plot_heatmap(results['binary_results'],
                                           branches=branches)
                     f1.savefig(os.path.join(plot_dirs,
                                             'binary_results_hm_scores.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
                     f2.savefig(os.path.join(plot_dirs,
                                             'binary_results_hm_counters.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
 
                     plt.close()
 
@@ -175,16 +246,24 @@ def my_app() -> None:
                         branches=branches)
                     cumulative_scores_fig.savefig(os.path.join(
                         plot_dirs, 'cumulative_results.pdf'),
-                    bbox_inches='tight')
+                        bbox_inches=None)
 
+                    f1, f2 = plot_lines(results['cumulative_results'],
+                                        branches=branches)
+                    f1.savefig(os.path.join(plot_dirs,
+                                            'lines_cumulative_results_hm_scores.pdf'),
+                               bbox_inches=None)
+                    f2.savefig(os.path.join(plot_dirs,
+                                            'lines_cumulative_results_hm_counters.pdf'),
+                               bbox_inches=None)
                     f1, f2 = plot_heatmap(results['cumulative_results'],
                                           branches=branches)
                     f1.savefig(os.path.join(plot_dirs,
                                             'cumulative_results_hm_scores.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
                     f2.savefig(os.path.join(plot_dirs,
                                             'cumulative_results_hm_counters.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
                     plt.close()
 
                 if 'entropy_results' in results:
@@ -192,16 +271,25 @@ def my_app() -> None:
                         results['entropy_results'],
                         branches=branches)
                     cumulative_scores_fig.savefig(os.path.join(
-                        plot_dirs, 'entropy_results.pdf'),bbox_inches='tight')
+                        plot_dirs, 'entropy_results.pdf'), bbox_inches=None)
+
+                    f1, f2 = plot_lines(results['entropy_results'],
+                                        branches=branches)
+                    f1.savefig(os.path.join(plot_dirs,
+                                            'lines_entropy_results_hm_scores.pdf'),
+                               bbox_inches=None)
+                    f2.savefig(os.path.join(plot_dirs,
+                                            'lines_entropy_results_hm_counters.pdf'),
+                               bbox_inches=None)
 
                     f1, f2 = plot_heatmap(results['entropy_results'],
                                           branches=branches)
                     f1.savefig(os.path.join(plot_dirs,
                                             'entropy_results_hm_scores.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
                     f2.savefig(os.path.join(plot_dirs,
                                             'entropy_results_hm_counters.pdf'),
-                               bbox_inches='tight')
+                               bbox_inches=None)
                     plt.close()
 
 

@@ -144,6 +144,108 @@ def my_app(cfg: DictConfig) -> None:
                                           get_binaries=get_binaries,
                                           fix_last_layer=fix_last_layer)
 
+        if method_cfg.get('pre_trained', False):
+            pre_trained_path = os.path.join('~/branch_models/',
+                                            '{}'.format(dataset_name),
+                                            '{}'.format(model_name))
+
+            pre_trained_path = os.path.expanduser(pre_trained_path)
+
+            pre_trained_model_path = os.path.join(pre_trained_path,
+                                                  'b{}.pt'.format(
+                                                      experiment))
+
+            pre_trained_classifier_path = os.path.join(pre_trained_path,
+                                                       'c{}.pt'.format(
+                                                           experiment))
+            log.info('Pre trained model path {}'.
+                     format(pre_trained_path))
+
+            pretrained_backbone, pretrained_classifiers = get_model(
+                model_name,
+                image_size=input_size,
+                classes=classes,
+                get_binaries=False)
+
+            if os.path.exists(pre_trained_model_path) and \
+                    os.path.exists(pre_trained_classifier_path):
+                log.info('Pre trained model loaded')
+
+                pretrained_backbone.load_state_dict(
+                    torch.load(pre_trained_model_path,
+                               map_location=device))
+                pretrained_classifiers.load_state_dict(
+                    torch.load(pre_trained_classifier_path,
+                               map_location=device))
+            else:
+
+                os.makedirs(pre_trained_path, exist_ok=True)
+
+                log.info('Training the base model')
+
+                pretrained_backbone.to(device)
+                pretrained_classifiers.to(device)
+
+                train_set, test_set, input_size, classes = \
+                    get_dataset(name=dataset_name,
+                                model_name=None,
+                                augmentation=True)
+
+                pre_trainloader = torch.utils.data.DataLoader(train_set,
+                                                              batch_size=batch_size,
+                                                              shuffle=True)
+
+                pre_testloader = torch.utils.data.DataLoader(test_set,
+                                                             batch_size=batch_size,
+                                                             shuffle=False)
+
+                parameters = chain(pretrained_backbone.parameters(),
+                                   pretrained_classifiers.parameters())
+
+                optimizer = get_optimizer(parameters=parameters,
+                                          name='sgd',
+                                          lr=0.01,
+                                          momentum=0.9,
+                                          weight_decay=0)
+
+                res = standard_trainer(model=pretrained_backbone,
+                                       predictors=pretrained_classifiers,
+                                       optimizer=optimizer,
+                                       train_loader=pre_trainloader,
+                                       epochs=epochs,
+                                       scheduler=None,
+                                       early_stopping=None,
+                                       test_loader=pre_testloader,
+                                       eval_loader=eval_loader)[0]
+
+                backbone_dict, classifiers_dict = res
+                # classifiers.load_state_dict(classifiers_dict)
+                torch.save(backbone_dict,
+                           pre_trained_model_path)
+                torch.save(classifiers_dict,
+                           pre_trained_classifier_path)
+
+                pretrained_classifiers.load_state_dict(classifiers_dict)
+                pretrained_backbone.load_state_dict(backbone_dict)
+
+                log.info('Pre trained model Saved.')
+
+            # train_scores = standard_eval(model=pretrained_backbone,
+            #                              dataset_loader=trainloader,
+            #                              classifier=pretrained_classifiers[
+            #                                  -1])
+
+            test_scores = standard_eval(model=pretrained_backbone,
+                                        dataset_loader=testloader,
+                                        classifier=pretrained_classifiers[
+                                            -1])
+
+            log.info('Pre trained model scores : {}, {}'.format(
+                -1,
+                test_scores))
+
+            backbone.load_state_dict(pretrained_backbone.state_dict())
+
         if os.path.exists(os.path.join(experiment_path, 'bb.pt')) and load:
             log.info('Model loaded')
 
@@ -163,95 +265,11 @@ def my_app(cfg: DictConfig) -> None:
 
             classifiers.load_state_dict(loaded_state_dict)
 
+            pre_trained_path = os.path.join('~/branch_models/',
+                                            '{}'.format(dataset_name),
+                                            '{}'.format(model_name))
+
         else:
-            if method_cfg.get('pre_trained', False):
-                pre_trained_path = os.path.join('~/branch_models/',
-                                                '{}'.format(dataset_name),
-                                                '{}'.format(model_name))
-
-                pre_trained_path = os.path.expanduser(pre_trained_path)
-
-                pre_trained_model_path = os.path.join(pre_trained_path,
-                                                      'b{}.pt'.format(
-                                                          experiment))
-
-                pre_trained_classifier_path = os.path.join(pre_trained_path,
-                                                           'c{}.pt'.format(
-                                                               experiment))
-                log.info('Pre trained model path {}'.
-                         format(pre_trained_path))
-
-                pretrained_backbone, pretrained_classifiers = get_model(
-                    model_name,
-                    image_size=input_size,
-                    classes=classes,
-                    get_binaries=False)
-
-                if os.path.exists(pre_trained_model_path) and \
-                        os.path.exists(pre_trained_classifier_path):
-                    log.info('Pre trained model loaded')
-
-                    pretrained_backbone.load_state_dict(
-                        torch.load(pre_trained_model_path,
-                                   map_location=device))
-                    pretrained_classifiers.load_state_dict(
-                        torch.load(pre_trained_classifier_path,
-                                   map_location=device))
-                else:
-
-                    os.makedirs(pre_trained_path, exist_ok=True)
-
-                    log.info('Training the base model')
-
-                    pretrained_backbone.to(device)
-                    pretrained_classifiers.to(device)
-
-                    parameters = chain(pretrained_backbone.parameters(),
-                                       pretrained_classifiers.parameters())
-
-                    optimizer = get_optimizer(parameters=parameters,
-                                              name='sgd',
-                                              lr=0.01,
-                                              momentum=0.9,
-                                              weight_decay=0)
-
-                    res = standard_trainer(model=pretrained_backbone,
-                                           predictors=pretrained_classifiers,
-                                           optimizer=optimizer,
-                                           train_loader=trainloader,
-                                           epochs=epochs,
-                                           scheduler=None,
-                                           early_stopping=None,
-                                           test_loader=testloader,
-                                           eval_loader=eval_loader)[0]
-
-                    backbone_dict, classifiers_dict = res
-                    # classifiers.load_state_dict(classifiers_dict)
-                    torch.save(backbone_dict,
-                               pre_trained_model_path)
-                    torch.save(classifiers_dict,
-                               pre_trained_classifier_path)
-
-                    pretrained_classifiers.load_state_dict(classifiers_dict)
-                    pretrained_backbone.load_state_dict(backbone_dict)
-
-                    log.info('Pre trained model Saved.')
-
-                # train_scores = standard_eval(model=pretrained_backbone,
-                #                              dataset_loader=trainloader,
-                #                              classifier=pretrained_classifiers[
-                #                                  -1])
-
-                test_scores = standard_eval(model=pretrained_backbone,
-                                            dataset_loader=testloader,
-                                            classifier=pretrained_classifiers[
-                                                -1])
-
-                log.info('Pre trained model scores : {}, {}'.format(
-                    -1,
-                    test_scores))
-
-                backbone.load_state_dict(pretrained_backbone.state_dict())
 
             backbone.to(device)
             classifiers.to(device)
@@ -409,7 +427,7 @@ def my_app(cfg: DictConfig) -> None:
 
             cumulative_threshold_scores = {}
 
-            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
+            for epsilon in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
@@ -426,9 +444,10 @@ def my_app(cfg: DictConfig) -> None:
                 #                                             dict(a), dict(b)))
 
                 s = '\tCumulative binary {}. '.format(epsilon)
+
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      a[k],
+                                                                      np.round(a[k] * 100, 2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)
@@ -439,7 +458,7 @@ def my_app(cfg: DictConfig) -> None:
             results['cumulative_results'] = cumulative_threshold_scores
 
             binary_threshold_scores = {}
-            for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
+            for epsilon in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
                 a, b = binary_eval(model=backbone,
                                    dataset_loader=testloader,
                                    predictors=classifiers,
@@ -455,7 +474,7 @@ def my_app(cfg: DictConfig) -> None:
                 s = '\tThreshold {}. '.format(epsilon)
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      a[k],
+                                                                      np.round(a[k] * 100, 2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)
@@ -484,7 +503,7 @@ def my_app(cfg: DictConfig) -> None:
 
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      a[k],
+                                                                      np.round(a[k] * 100, 2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)

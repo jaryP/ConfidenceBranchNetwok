@@ -362,6 +362,7 @@ def binary_bernulli_trainer(model: BranchModel,
                         h = h / np.log(sf.shape[-1])
                         h = h.sum(-1)
                         prior_gt = 1 - h
+                        prior_gt = prior_gt.unsqueeze(-1)
 
                     elif prior_mode == 'ones':
                         _y = y.unsqueeze(1)
@@ -398,7 +399,7 @@ def binary_bernulli_trainer(model: BranchModel,
                 # # #
                 # #
                 # #
-                # kl *= (1 - klw)
+                # kl *= klw
 
             else:
                 kl_losses.append(0)
@@ -532,31 +533,31 @@ def binary_bernulli_trainer(model: BranchModel,
                           predictors=predictors)
         s = dict(s)
         print(s)
-
-        print(binary_statistics(model=model,
-                                dataset_loader=test_loader,
-                                predictors=predictors))
-
-        for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            prior_gt, b = binary_eval(model=model,
-                                      dataset_loader=test_loader,
-                                      predictors=predictors,
-                                      epsilon=[
-                                                  0.7 if epsilon <= 0.7 else epsilon] +
-                                              [epsilon] *
-                                              (model.n_branches() - 1),
-                                      cumulative_threshold=False)
-
-            prior_gt, b = dict(prior_gt), dict(b)
-
-            s = '\tEpsilon {}. '.format(epsilon)
-            for k in sorted([k for k in prior_gt.keys() if k != 'global']):
-                s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                  prior_gt[k],
-                                                                  b[k])
-            s += 'Global score: {}'.format(prior_gt['global'])
-
-            print(s)
+        #
+        # print(binary_statistics(model=model,
+        #                         dataset_loader=test_loader,
+        #                         predictors=predictors))
+        #
+        # for epsilon in [0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        #     prior_gt, b = binary_eval(model=model,
+        #                               dataset_loader=test_loader,
+        #                               predictors=predictors,
+        #                               epsilon=[
+        #                                           0.7 if epsilon <= 0.7 else epsilon] +
+        #                                       [epsilon] *
+        #                                       (model.n_branches() - 1),
+        #                               cumulative_threshold=False)
+        #
+        #     prior_gt, b = dict(prior_gt), dict(b)
+        #
+        #     s = '\tEpsilon {}. '.format(epsilon)
+        #     for k in sorted([k for k in prior_gt.keys() if k != 'global']):
+        #         s += 'Branch {}, score: {}, counter: {}. '.format(k,
+        #                                                           np.round(prior_gt[k] * 100, 2),
+        #                                                           b[k])
+        #     s += 'Global score: {}'.format(prior_gt['global'])
+        #
+        #     print(s)
 
         mean_kl_loss = np.mean(kl_losses)
         mean_losses.append(mean_loss)

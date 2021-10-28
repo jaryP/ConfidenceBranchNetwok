@@ -8,6 +8,7 @@ from torchvision.transforms import Resize, ToTensor, Normalize, Compose, \
     RandomHorizontalFlip, RandomCrop
 
 from models.resnet import resnet20
+from models.vgg import vgg11
 
 
 def get_device(model: nn.Module):
@@ -19,7 +20,6 @@ def get_intermediate_classifiers(model,
                                  num_classes,
                                  binary_branch=False,
                                  fix_last_layer=False):
-
     predictors = nn.ModuleList()
     x = torch.randn((1,) + image_size)
     outputs = model(x)
@@ -80,7 +80,7 @@ def get_intermediate_classifiers(model,
                 seq = nn.Sequential(
                     nn.ReLU(),
                     nn.Conv2d(chs, 128,
-                              kernel_size=3, stride=1),
+                              kernel_size=2, stride=1),
                     # nn.MaxPool2d(2),
                     nn.ReLU())
             # if i == 0:
@@ -140,6 +140,11 @@ def get_model(name, image_size, classes, get_binaries=False,
     name = name.lower()
     if name == 'alexnet':
         model = AlexNet(image_size[0])
+    elif 'vgg' in name:
+        if name == 'vgg11':
+            model = vgg11()
+        else:
+            assert False
     elif 'resnet' in name:
         if name == 'resnet20':
             model = resnet20(None)
@@ -273,17 +278,22 @@ def get_dataset(name, model_name, augmentation=False):
         input_size, classes = (3, 32, 32), 10
 
     elif name == 'cifar100':
-        tt = [
-            RandomCrop(32, padding=4),
-            RandomHorizontalFlip(),
+        if augmentation:
+            tt = [
+                RandomCrop(32, padding=4),
+                RandomHorizontalFlip(), ]
+        else:
+            tt = []
+
+        tt.extend([
             ToTensor(),
             Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010))]
+                      (0.2023, 0.1994, 0.2010))])
 
         t = [
             ToTensor(),
             Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010))]
+                      (0.2023, 0.1994, 0.2010))]
 
         transform = Compose(t)
         train_transform = Compose(tt)

@@ -4,6 +4,6 @@ joint_type: losses
 sample: true
 pre_trained: true
 method.regularization_loss: bce
-method.prior_mode: ones
+prior_mode: ones
 fix_last_layer: false
 normalize_weights: false
