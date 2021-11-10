@@ -9,10 +9,10 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from base.evaluators import binary_eval, entropy_eval, standard_eval, \
-    branches_eval
+    branches_eval, binary_statistics
 from base.trainer import binary_bernulli_trainer, joint_trainer, \
-    standard_trainer
-from utils import get_dataset, get_optimizer, get_model
+    standard_trainer, adaptive_trainer
+from utils import get_dataset, get_optimizer, get_model, EarlyStopping
 
 
 @hydra.main(config_path="configs",
@@ -39,29 +39,17 @@ def my_app(cfg: DictConfig) -> None:
     method_cfg = cfg['method']
     method_name = method_cfg['name']
 
-    get_binaries = True if method_name == 'bernulli' else False
-
-    # trainer = None
-
-    # if method_name == 'bernulli':
-    #     trainer = binary_bernulli_trainer
-
-    # distance_regularization, distance_weight, similarity = method_cfg.get(
-    #     'distance_regularization', True), \
-    #                                                        method_cfg.get(
-    #                                                            'distance_weight',
-    #                                                            1), \
-    #                                                        method_cfg[
-    #                                                            'similarity']
-    # ensemble_dropout = method_cfg.get('ensemble_dropout', 0)
-    # anneal_dirichlet = method_cfg.get('anneal_dirichlet', True)
-    # test_samples = method_cfg.get('test_samples', 1)
+    get_binaries = True if method_name in ['bernulli', 'adaptive'] \
+        else False
 
     training_cfg = cfg['training']
     epochs, batch_size, device = training_cfg['epochs'], \
                                  training_cfg['batch_size'], \
                                  training_cfg.get('device', 'cpu')
     eval_percentage = training_cfg.get('eval_split', None)
+
+    use_early_stopping = training_cfg.get('use_early_stopping', False)
+    early_stopping_tolerance = training_cfg.get('early_stopping_tolerance', 5)
 
     optimizer_cfg = cfg['optimizer']
     optimizer_name, lr, momentum, weight_decay = optimizer_cfg.get('optimizer',
@@ -90,6 +78,13 @@ def my_app(cfg: DictConfig) -> None:
         os.chdir(path)
         os.makedirs(path, exist_ok=True)
 
+    if use_early_stopping:
+        early_stopping = EarlyStopping(
+            tolerance=early_stopping_tolerance,
+            min=not (eval_percentage is not None and eval_percentage > 0))
+    else:
+        early_stopping = None
+
     for experiment in range(experiments):
         log.info('Experiment #{}'.format(experiment))
 
@@ -99,7 +94,11 @@ def my_app(cfg: DictConfig) -> None:
         experiment_path = os.path.join(path, 'exp_{}'.format(experiment))
         os.makedirs(experiment_path, exist_ok=True)
 
+        log.info('Experiment path: {}'.format(experiment_path))
+
         eval_loader = None
+        eval = None
+
         train_set, test_set, input_size, classes = \
             get_dataset(name=dataset_name,
                         model_name=None,
@@ -114,17 +113,17 @@ def my_app(cfg: DictConfig) -> None:
             train_set, eval = torch.utils.data.random_split(train_set,
                                                             [train_len,
                                                              eval_len])
-            # train_loader = torch.utils.data.DataLoader(dataset=train,
-            #                                            batch_size=batch_size,
-            #                                            shuffle=True)
+            eval.transform = test_set.transform
+            eval.target_transform = test_set.target_transform
+
             eval_loader = torch.utils.data.DataLoader(dataset=eval,
                                                       batch_size=batch_size,
                                                       shuffle=False)
 
-            # logger.info('Train dataset size: {}'.format(len(train)))
-            # logger.info('Test dataset size: {}'.format(len(test)))
-            # logger.info(
-            #     'Eval dataset created, having size: {}'.format(len(eval)))
+        log.info('Train dataset size: {}'.format(len(train_set)))
+        log.info('Test dataset size: {}'.format(len(test_set)))
+        if eval is not None:
+            log.info('Eval dataset size: {}'.format(len(eval)))
 
         trainloader = torch.utils.data.DataLoader(train_set,
                                                   batch_size=batch_size,
@@ -143,6 +142,15 @@ def my_app(cfg: DictConfig) -> None:
                                           classes=classes,
                                           get_binaries=get_binaries,
                                           fix_last_layer=fix_last_layer)
+
+        # costs = backbone.computational_cost(next(iter(trainloader))[0])
+        # bs = backbone(next(iter(trainloader))[0])
+        # print(costs, backbone.branches)
+        # total_cost = costs[backbone.n_branches() - 1]
+        # normalize_costs = {k: v / total_cost for k, v in costs.items()}
+        #
+        # print(len(bs))
+        # input(normalize_costs)
 
         if method_cfg.get('pre_trained', False):
             pre_trained_path = os.path.join('~/branch_models/',
@@ -214,7 +222,7 @@ def my_app(cfg: DictConfig) -> None:
                                        train_loader=pre_trainloader,
                                        epochs=epochs,
                                        scheduler=None,
-                                       early_stopping=None,
+                                       early_stopping=early_stopping,
                                        test_loader=pre_testloader,
                                        eval_loader=eval_loader)[0]
 
@@ -293,39 +301,53 @@ def my_app(cfg: DictConfig) -> None:
             if method_name == 'bernulli':
 
                 priors = method_cfg.get('priors', 0.5)
-                fixed_bernulli = method_cfg.get('fixed_bernulli', False)
                 joint_type = method_cfg.get('joint_type', 'predictions')
-                prior_w = method_cfg.get('prior_w', 1e-3)
+                beta = method_cfg.get('beta', 1e-3)
                 sample = method_cfg.get('sample', True)
 
                 recursive = method_cfg.get('recursive', False)
                 normalize_weights = method_cfg.get('normalize_weights', False)
-                calibrate = method_cfg.get('calibrate', False)
                 prior_mode = method_cfg.get('prior_mode', 'ones')
                 regularization_loss = method_cfg.get('regularization_loss',
                                                      'bce')
+                temperature_scaling = method_cfg.get('temperature_scaling',
+                                                     True)
+                regularization_scaling = method_cfg.get(
+                    'regularization_scaling',
+                    True)
+
+                dropout = method_cfg.get('dropout', 0.0)
+                backbone_epochs = method_cfg.get('backbone_epochs', 0.0)
+
+                if normalize_weights:
+                    assert fix_last_layer
 
                 res = binary_bernulli_trainer(model=backbone,
                                               predictors=classifiers,
-                                              bernulli_models=classifiers,
                                               optimizer=optimizer,
                                               train_loader=trainloader,
                                               epochs=epochs,
                                               prior_parameters=priors,
                                               joint_type=joint_type,
-                                              prior_w=prior_w,
+                                              beta=beta,
                                               sample=sample,
                                               prior_mode=prior_mode,
                                               eval_loader=eval_loader,
                                               recursive=recursive,
                                               test_loader=testloader,
-                                              fixed_bernulli=fixed_bernulli,
                                               fix_last_layer=fix_last_layer,
                                               normalize_weights=
                                               normalize_weights,
-                                              calibrate=calibrate,
+                                              temperature_scaling=
+                                              temperature_scaling,
                                               regularization_loss=
-                                              regularization_loss)[0]
+                                              regularization_loss,
+                                              regularization_scaling=
+                                              regularization_scaling,
+                                              dropout=dropout,
+                                              backbone_epochs=
+                                              backbone_epochs,
+                                              early_stopping=early_stopping)[0]
 
                 backbone_dict, classifiers_dict = res
 
@@ -361,8 +383,28 @@ def my_app(cfg: DictConfig) -> None:
                                     weights=weights, train_loader=trainloader,
                                     epochs=epochs,
                                     scheduler=None, joint_type=joint_type,
-                                    early_stopping=None, test_loader=testloader,
-                                    eval_loader=None)[0]
+                                    test_loader=testloader,
+                                    eval_loader=eval_loader,
+                                    early_stopping=early_stopping)[0]
+
+                backbone_dict, classifiers_dict = res
+
+                backbone.load_state_dict(backbone_dict)
+                classifiers.load_state_dict(classifiers_dict)
+
+            elif method_name == 'adaptive':
+                reg_w = method_cfg.get('reg_w', 1)
+
+                res = adaptive_trainer(model=backbone,
+                                       predictors=classifiers,
+                                       optimizer=optimizer,
+                                       train_loader=trainloader,
+                                       epochs=epochs,
+                                       scheduler=None,
+                                       test_loader=testloader,
+                                       eval_loader=eval_loader,
+                                       early_stopping=early_stopping,
+                                       reg_w=reg_w)[0]
 
                 backbone_dict, classifiers_dict = res
 
@@ -377,9 +419,9 @@ def my_app(cfg: DictConfig) -> None:
                                        train_loader=trainloader,
                                        epochs=epochs,
                                        scheduler=None,
-                                       early_stopping=None,
                                        test_loader=testloader,
-                                       eval_loader=eval_loader)[0]
+                                       eval_loader=eval_loader,
+                                       early_stopping=early_stopping)[0]
 
                 backbone_dict, classifiers_dict = res
 
@@ -423,7 +465,22 @@ def my_app(cfg: DictConfig) -> None:
 
             log.info('Branches scores: {}'.format(scores))
 
+            costs = backbone.computational_cost(next(iter(trainloader))[0])
+            # tot = costs[backbone.n_branches() - 1]
+            # costs = {k: v / tot for k, v in costs.items()}
+            # input(costs)
+            # results['costs'] = costs
+            results['costs'] = costs
+
         if 'bernulli' in method_name:
+
+            correct_stats, incorrect_stats = \
+                binary_statistics(model=backbone,
+                                  dataset_loader=testloader,
+                                  predictors=classifiers)
+
+            results['binary_statistics'] = {'correct': correct_stats,
+                                            'incorrect': incorrect_stats}
 
             cumulative_threshold_scores = {}
 
@@ -435,6 +492,8 @@ def my_app(cfg: DictConfig) -> None:
                                                0.7 if epsilon <= 0.7 else epsilon] +
                                            [epsilon] *
                                            (backbone.n_branches() - 1),
+                                   # epsilon=[epsilon] *
+                                   #         (backbone.n_branches()),
                                    cumulative_threshold=True,
                                    sample=False)
 
@@ -447,7 +506,10 @@ def my_app(cfg: DictConfig) -> None:
 
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      np.round(a[k] * 100, 2),
+                                                                      np.round(
+                                                                          a[
+                                                                              k] * 100,
+                                                                          2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)
@@ -465,7 +527,10 @@ def my_app(cfg: DictConfig) -> None:
                                    epsilon=[
                                                0.7 if epsilon <= 0.7 else epsilon] +
                                            [epsilon] *
-                                           (backbone.n_branches() - 1))
+                                           (backbone.n_branches() - 1)
+                                   # epsilon=[epsilon] *
+                                   #         (backbone.n_branches()),
+                                   )
 
                 a, b = dict(a), dict(b)
 
@@ -474,7 +539,10 @@ def my_app(cfg: DictConfig) -> None:
                 s = '\tThreshold {}. '.format(epsilon)
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      np.round(a[k] * 100, 2),
+                                                                      np.round(
+                                                                          a[
+                                                                              k] * 100,
+                                                                          2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)
@@ -485,6 +553,7 @@ def my_app(cfg: DictConfig) -> None:
             results['binary_results'] = binary_threshold_scores
 
         if method_name in ['bernulli', 'joint']:
+
             entropy_threshold_scores = {}
 
             for entropy_threshold in [0.0001, 0.01, 0.1, .2, .4, .5, .6, .7,
@@ -503,7 +572,10 @@ def my_app(cfg: DictConfig) -> None:
 
                 for k in sorted([k for k in a.keys() if k != 'global']):
                     s += 'Branch {}, score: {}, counter: {}. '.format(k,
-                                                                      np.round(a[k] * 100, 2),
+                                                                      np.round(
+                                                                          a[
+                                                                              k] * 100,
+                                                                          2),
                                                                       b[k])
                 s += 'Global score: {}'.format(a['global'])
                 log.info(s)

@@ -41,6 +41,7 @@ def standard_eval(model: BranchModel,
     device = get_device(model)
 
     model.eval()
+    classifier.eval()
 
     total = 0
     correct = 0
@@ -66,29 +67,47 @@ def branches_eval(model: BranchModel, predictors, dataset_loader):
     model.eval()
     predictors.eval()
 
-    scores = {}
+    corrects = defaultdict(int)
+    tot = 0
 
-    for i in range(len(predictors)):
-        predictor = predictors[i]
+    for x, y in dataset_loader:
+        tot += x.shape[0]
 
-        total = 0
-        correct = 0
+        x, y = x.to(device), y.to(device)
 
-        for x, y in dataset_loader:
-            x, y = x.to(device), y.to(device)
+        preds = model(x)
 
-            pred = model(x)[i]
+        for j, bo in enumerate(preds):
+            l = predictors[j].logits(bo)
+            p = torch.argmax(l, 1)
 
-            pred = predictor.logits(pred)
-            pred = torch.argmax(pred, 1)
+            correct = (p == y).sum().item()
+            corrects[j] += correct
 
-            total += y.size(0)
-            correct += (pred == y).sum().item()
+    scores = {k: v / tot for k, v in corrects.items()}
+    scores['final'] = scores.pop(len(predictors) - 1)
 
-        if i == (len(predictors) - 1):
-            i = 'final'
-
-        scores[i] = correct / total
+    # for i in range(len(predictors)):
+    #     predictor = predictors[i]
+    #
+    #     total = 0
+    #     correct = 0
+    #
+    #     for x, y in dataset_loader:
+    #         x, y = x.to(device), y.to(device)
+    #
+    #         pred = model(x)[i]
+    #
+    #         pred = predictor.logits(pred)
+    #         pred = torch.argmax(pred, 1)
+    #
+    #         total += y.size(0)
+    #         correct += (pred == y).sum().item()
+    #
+    #     if i == (len(predictors) - 1):
+    #         i = 'final'
+    #
+    #     scores[i] = correct / total
 
     return scores
 
@@ -248,7 +267,6 @@ def binary_eval(model: BranchModel,
                 if pred == y[bi]:
                     exits_corrected[i] += 1
 
-
     branches_scores = {}
     tot = 0
     correctly_predicted = 0
@@ -293,6 +311,7 @@ def binary_statistics(model: BranchModel,
             pred = model(x)[i]
 
             pred, hs = predictor(pred)
+
             pred = torch.argmax(pred, 1)
 
             for p, h, y in zip(pred, hs, y):
@@ -302,18 +321,18 @@ def binary_statistics(model: BranchModel,
                 else:
                     incorrect[i].append(h)
 
-    correct_results = {}
-    incorrect_results = {}
+    # correct_results = {}
+    # incorrect_results = {}
 
-    for i in range(len(predictors)):
-        mn = np.mean(correct[i])
-        std = np.std(correct[i])
+    # for i in range(len(predictors)):
+    #     mn = np.mean(correct[i])
+    #     std = np.std(correct[i])
+    #
+    #     correct_results[i] = {'mean': mn, 'std': std}
+    #
+    #     mn = np.mean(incorrect[i])
+    #     std = np.std(incorrect[i])
+    #
+    #     incorrect_results[i] = {'mean': mn, 'std': std}
 
-        correct_results[i] = {'mean': mn, 'std': std}
-
-        mn = np.mean(incorrect[i])
-        std = np.std(incorrect[i])
-
-        incorrect_results[i] = {'mean': mn, 'std': std}
-
-    return correct_results, incorrect_results
+    return dict(correct), dict(incorrect)

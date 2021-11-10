@@ -1,3 +1,5 @@
+import numpy as np
+
 from models.alexnet import AlexnetClassifier, AlexNet
 from models.base import IntermediateBranch, BinaryIntermediateBranch
 
@@ -13,6 +15,41 @@ from models.vgg import vgg11
 
 def get_device(model: nn.Module):
     return next(model.parameters()).device
+
+
+class EarlyStopping:
+    def __init__(self, tolerance, min=True, **kwargs):
+        self.initial_tolerance = tolerance
+        self.tolerance = tolerance
+        self.min = min
+
+        if self.min:
+            self.current_value = np.inf
+            self.c = lambda a, b: a < b
+        else:
+            self.current_value = -np.inf
+            self.c = lambda a, b: a > b
+
+    def step(self, v):
+        if self.c(v, self.current_value):
+            self.tolerance = self.initial_tolerance
+            self.current_value = v
+            return 1
+        else:
+            self.tolerance -= 1
+            if self.tolerance <= 0:
+                return -1
+        return 0
+
+    def reset(self):
+        self.tolerance = self.initial_tolerance
+        self.current_value = 0
+        if self.min:
+            self.current_value = np.inf
+            self.c = lambda a, b: a < b
+        else:
+            self.current_value = -np.inf
+            self.c = lambda a, b: a > b
 
 
 def get_intermediate_classifiers(model,
@@ -37,27 +74,15 @@ def get_intermediate_classifiers(model,
 
                     b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                                  classifier=linear_layers,
-                                                 # constant_binary_output=1.0,
                                                  return_one=True)
                 else:
                     linear_layers = nn.Sequential(*[nn.ReLU(),
                                                     nn.Linear(od,
                                                               num_classes + 1)])
 
-                    bias = linear_layers[-1].bias.data
-                    bias[-1] = 10
-                    # linear_layers[-1].bias.data = bias
-                    # binary_layers = nn.Sequential(*[nn.ReLU(),
-                    #                                 nn.Linear(num_classes,
-                    #                                           num_classes),
-                    #                                 nn.ReLU(),
-                    #                                 nn.Linear(num_classes, 1),
-                    #                                 nn.Sigmoid()
-                    #                                 ])
-                    #
+
                     b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                                  classifier=linear_layers,
-                                                 # binary_classifier=binary_layers
                                                  )
             else:
                 linear_layers = nn.Sequential(*[nn.ReLU(),
@@ -83,21 +108,6 @@ def get_intermediate_classifiers(model,
                               kernel_size=2, stride=1),
                     # nn.MaxPool2d(2),
                     nn.ReLU())
-            # if i == 0:
-            #     seq = nn.Sequential(
-            #         nn.ReLU(),
-            #         nn.Conv2d(chs, 128,
-            #                   kernel_size=3),
-            #         nn.MaxPool2d(3),
-            #         # nn.ReLU(),
-            #         # nn.Conv2d(chs * 2, chs * 2,
-            #         #           kernel_size=3),
-            #         nn.ReLU())
-            # else:
-            #     seq = nn.Sequential(nn.MaxPool2d(3),
-            #                         nn.ReLU(),
-            #                         nn.Conv2d(chs, 128, kernel_size=3),
-            #                         nn.ReLU())
 
             seq.add_module('flatten', nn.Flatten())
 
@@ -108,20 +118,10 @@ def get_intermediate_classifiers(model,
             if binary_branch:
                 linear_layers = nn.Sequential(*[nn.ReLU(),
                                                 nn.Linear(od, num_classes + 1)])
-                bias = linear_layers[-1].bias.data
-                bias[-1] = 10
-                # linear_layers[-1].bias.data = bias
-                # binary_layers = nn.Sequential(*[nn.ReLU(),
-                #                                 nn.Linear(num_classes, num_classes),
-                #                                 nn.ReLU(),
-                #                                 nn.Linear(num_classes, 1),
-                #                                 nn.Sigmoid()
-                #                                 ])
 
                 predictors.append(
                     BinaryIntermediateBranch(preprocessing=seq,
                                              classifier=linear_layers,
-                                             # binary_classifier=binary_layers
                                              ))
 
             else:
@@ -281,7 +281,8 @@ def get_dataset(name, model_name, augmentation=False):
         if augmentation:
             tt = [
                 RandomCrop(32, padding=4),
-                RandomHorizontalFlip(), ]
+                RandomHorizontalFlip(),
+            ]
         else:
             tt = []
 
