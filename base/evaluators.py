@@ -4,10 +4,8 @@ from typing import List, Union
 import numpy as np
 import torch
 from torch import nn
-from tqdm import tqdm
-
-from bayesian.posteriors import BayesianPosterior, BayesianHead, BayesianHeads
-from models.base import BranchModel
+from models.base import BranchModel, IntermediateBranch
+from utils import get_device
 
 
 def accuracy_score(expected: np.asarray, predicted: np.asarray, topk=None):
@@ -22,7 +20,8 @@ def accuracy_score(expected: np.asarray, predicted: np.asarray, topk=None):
     assert len(predicted.shape) == 2 and len(expected.shape) == 1
     assert predicted.shape[1] >= max(topk)
 
-    res = defaultdict(int)
+    res = {k: 0 for k in topk}
+
     total = len(expected)
 
     for t, p in zip(expected, predicted):
@@ -35,99 +34,111 @@ def accuracy_score(expected: np.asarray, predicted: np.asarray, topk=None):
     return res
 
 
-def standard_eval(model: BranchModel, dataset_loader,
-                  device='cpu', topk=None):
-    true_labels = []
-    pred_labels = []
+@torch.no_grad()
+def standard_eval(model: BranchModel,
+                  classifier: IntermediateBranch,
+                  dataset_loader):
+    device = get_device(model)
 
     model.eval()
+    classifier.eval()
 
-    with torch.no_grad():
-        for x, y in dataset_loader:
-            x, y = x.to(device), y.to(device)
-            final_preds, preds = model(x)
-
-            true_labels.extend(y.tolist())
-
-            top_classes = torch.topk(final_preds, final_preds.size(-1))[1]
-            pred_labels.extend(top_classes.tolist())
-
-            # for i in range(len(preds) - 1):
-            #     p = predictors[i](preds[i])
-            #     # pred = torch.argmax(pred, -1)
-            #     top_classes = torch.topk(p, p.size(-1))[1]
-            #     pred_labels[i].extend(top_classes.tolist())
-
-        scores = accuracy_score(np.asarray(true_labels),
-                                np.asarray(pred_labels), topk=topk)
-
-    return scores
-
-
-@torch.no_grad()
-def branches_eval(model: BranchModel, predictors, dataset_loader,
-                  device='cpu', topk=None):
-    true_labels = []
-    pred_labels = defaultdict(list)
+    total = 0
+    correct = 0
 
     for x, y in dataset_loader:
-        model.eval()
-        predictors.eval()
+        x, y = x.to(device), y.to(device)
+
+        final_preds = classifier.logits(model(x)[-1])
+        pred = torch.argmax(final_preds, 1)
+
+        total += y.size(0)
+        correct += (pred == y).sum().item()
+
+    score = correct / total
+
+    return score
+
+
+@torch.no_grad()
+def branches_eval(model: BranchModel, predictors, dataset_loader):
+    device = get_device(model)
+
+    model.eval()
+    predictors.eval()
+
+    corrects = defaultdict(int)
+    tot = 0
+
+    for x, y in dataset_loader:
+        tot += x.shape[0]
 
         x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
 
-        true_labels.extend(y.tolist())
+        preds = model(x)
 
-        top_classes = torch.topk(final_preds, final_preds.size(-1))[1]
-        pred_labels['final'].extend(top_classes.tolist())
+        for j, bo in enumerate(preds):
+            l = predictors[j].logits(bo)
+            p = torch.argmax(l, 1)
 
-        for i in range(len(preds)):
-            p = predictors[i](preds[i])
-            # pred = torch.argmax(pred, -1)
-            top_classes = torch.topk(p, p.size(-1))[1]
-            pred_labels[i].extend(top_classes.tolist())
+            correct = (p == y).sum().item()
+            corrects[j] += correct
 
-    true_labels = np.asarray(true_labels)
-    scores = {i: accuracy_score(true_labels, np.asarray(p), topk=topk)
-              for i, p in pred_labels.items()}
+    scores = {k: v / tot for k, v in corrects.items()}
+    scores['final'] = scores.pop(len(predictors) - 1)
+
+    # for i in range(len(predictors)):
+    #     predictor = predictors[i]
+    #
+    #     total = 0
+    #     correct = 0
+    #
+    #     for x, y in dataset_loader:
+    #         x, y = x.to(device), y.to(device)
+    #
+    #         pred = model(x)[i]
+    #
+    #         pred = predictor.logits(pred)
+    #         pred = torch.argmax(pred, 1)
+    #
+    #         total += y.size(0)
+    #         correct += (pred == y).sum().item()
+    #
+    #     if i == (len(predictors) - 1):
+    #         i = 'final'
+    #
+    #     scores[i] = correct / total
 
     return scores
 
 
 @torch.no_grad()
-def branches_entropy(model: BranchModel,
-                     predictors: Union[nn.ModuleList, BayesianHeads],
-                     threshold: Union[List[float], float],
-                     dataset_loader,
-                     device='cpu',
-                     samples=1,
-                     topk=None):
+def entropy_eval(model: BranchModel,
+                 predictors: nn.ModuleList,
+                 threshold: Union[List[float], float],
+                 dataset_loader):
     model.eval()
     predictors.eval()
+    device = get_device(model)
 
     if isinstance(threshold, float):
         threshold = [threshold] * model.n_branches()
 
     exits_counter = defaultdict(int)
-
-    true_labels = defaultdict(list)
-    pred_labels = defaultdict(list)
+    exits_corrected = defaultdict(int)
 
     for x, y in dataset_loader:
         x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
 
-        logits = []
+        preds = model(x)
 
-        for i, predictor in enumerate(predictors):
-            if isinstance(predictor, BayesianHead):
-                p = predictor(logits=preds[i],
-                              branch_index=i, samples=samples)
-            else:
-                p = predictor(preds[i])
+        distributions, logits = [], []
 
-            logits.append(p)
+        for j, bo in enumerate(preds):
+            l = predictors[j].logits(bo)
+            logits.append(l)
+
+        logits = torch.stack(logits, 0)
 
         for bi in range(x.shape[0]):
             found = False
@@ -136,331 +147,192 @@ def branches_entropy(model: BranchModel,
                 p = logits[i][bi]  # .unsqueeze(0)
                 sf = nn.functional.softmax(p, -1)
                 h = -(sf + 1e-12).log() * sf
-                # print(bi, i, h.sum())
                 h = h / np.log(sf.shape[-1])
                 h = h.sum()
+
                 if h < threshold[i]:
-                    top_classes = torch.topk(p, p.size(-1))[1]
-                    pred_labels[i].append(top_classes.tolist())
-                    true_labels[i].append(y[bi].item())
+                    pred = torch.argmax(p)
+
+                    if pred == y[bi]:
+                        exits_corrected[i] += 1
+
                     exits_counter[i] += 1
                     found = True
                     break
 
             if not found:
-                top_classes = \
-                    torch.topk(final_preds[bi], final_preds.size(-1))[1]
-                true_labels['final'].append(y[bi].item())
-                pred_labels['final'].append(top_classes.tolist())
-                exits_counter['final'] += 1
+                i = len(predictors) - 1
+                p = logits[i][bi]
 
-        # true_labels = np.asarray(true_labels)
-        scores = {i: accuracy_score(true_labels[i], p, topk=topk)
-                  for i, p in pred_labels.items()}
+                exits_counter[i] += 1
+                pred = torch.argmax(p)
 
-        keys = list(range(model.n_branches())) + ['final']
-        all_labels = []
-        all_preds = []
+                if pred == y[bi]:
+                    exits_corrected[i] += 1
 
-        for k in keys:
-            if len(true_labels[k]) == 0:
-                continue
-            all_labels.append(true_labels[k])
-            all_preds.append(pred_labels[k])
+    branches_scores = {}
+    tot = 0
+    correctly_predicted = 0
 
-        all_labels = np.concatenate(all_labels)
-        all_preds = np.concatenate(all_preds, 0)
+    for k in exits_counter:
+        correct = exits_corrected[k]
+        counter = exits_counter.get(k, 0)
 
-        # all_labels = np.concatenate(
-        #     [true_labels[i] for i, p in pred_labels.items()])
-        # all_preds = np.concatenate([p for i, p in pred_labels.items()], 0)
+        if counter == 0:
+            score = 0
+        else:
+            score = correct / counter
 
-        scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
+        branches_scores[k] = score
 
-        # scores['branches_counter'] = exits_counter
+        tot += counter
+        correctly_predicted += correct
 
-    return scores, exits_counter
+    branches_scores['global'] = correctly_predicted / tot
+
+    return branches_scores, exits_counter
 
 
 @torch.no_grad()
-def eval_branches_entropy(model: BranchModel,
-                          predictors: Union[nn.ModuleList, BayesianHeads],
-                          percentile,
-                          # threshold: Union[List[float], float],
-                          dataset_loader,
-                          eval_loader,
-                          device='cpu',
-                          samples=1,
-                          topk=None):
+def binary_eval(model: BranchModel,
+                predictors: nn.ModuleList,
+                dataset_loader,
+                epsilon: Union[List[float], float] = None,
+                cumulative_threshold=False,
+                sample=False):
     model.eval()
     predictors.eval()
+    # binary_classifiers.eval()
+    device = get_device(model)
 
-    # if isinstance(threshold, float):
-    #     threshold = [threshold] * model.n_branches()
+    if epsilon is None:
+        epsilon = 0.5
+
+    if isinstance(epsilon, float):
+        epsilon = [epsilon] * model.n_branches()
 
     exits_counter = defaultdict(int)
+    exits_corrected = defaultdict(int)
 
-    true_labels = defaultdict(list)
-    pred_labels = defaultdict(list)
-
-    h = defaultdict(list)
-    for x, y in eval_loader:
+    for x, y in dataset_loader:
         x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
+
+        preds = model(x)
+
+        distributions, logits = [], []
+
+        for j, bo in enumerate(preds):
+            l, b = predictors[j](bo)
+            distributions.append(b)
+            logits.append(l)
+
+        distributions = torch.stack(distributions, 0)
+
+        # if sample:
+        #     distributions = ContinuousBernoulli(distributions).rsample()
+
+        if cumulative_threshold:
+            distributions[1:] = distributions[1:] * \
+                            torch.cumprod(1 - distributions[:-1], 0)
+            distributions = torch.cumsum(distributions, dim=0)
+
+        logits = torch.stack(logits, 0)
 
         for bi in range(x.shape[0]):
             found = False
-            logits = []
 
-            for i, predictor in enumerate(predictors):
-                if isinstance(predictor, BayesianHead):
-                    p = predictor(logits=preds[i],
-                                  branch_index=i, samples=samples)
+            # b = 0
+            for i in range(logits.shape[0]):
+
+                b = distributions[i][bi]
+
+                if b >= epsilon[i]:
+                    p = logits[i][bi]
+                    pred = torch.argmax(p)
+                    if pred == y[bi]:
+                        exits_corrected[i] += 1
+
+                    exits_counter[i] += 1
+
+                    found = True
+                    break
+
+            if not found:
+                i = len(predictors) - 1
+                p = logits[i][bi]
+
+                exits_counter[i] += 1
+                pred = torch.argmax(p)
+
+                if pred == y[bi]:
+                    exits_corrected[i] += 1
+
+    branches_scores = {}
+    tot = 0
+    correctly_predicted = 0
+
+    for k in exits_counter:
+        correct = exits_corrected[k]
+        counter = exits_counter.get(k, 0)
+
+        if counter == 0:
+            score = 0
+        else:
+            score = correct / counter
+
+        branches_scores[k] = score
+
+        tot += counter
+        correctly_predicted += correct
+
+    branches_scores['global'] = correctly_predicted / tot
+
+    return branches_scores, exits_counter
+
+
+@torch.no_grad()
+def binary_statistics(model: BranchModel,
+                      predictors: nn.ModuleList,
+                      dataset_loader):
+
+    model.eval()
+    predictors.eval()
+    device = get_device(model)
+
+    correct = defaultdict(list)
+    incorrect = defaultdict(list)
+
+    for i in range(len(predictors)):
+        predictor = predictors[i]
+
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+
+            pred = model(x)[i]
+
+            pred, hs = predictor(pred)
+
+            pred = torch.argmax(pred, 1)
+
+            for p, h, y in zip(pred, hs, y):
+                h = h.item()
+                if y == p:
+                    correct[i].append(h)
                 else:
-                    p = predictor(preds[i])
+                    incorrect[i].append(h)
 
-                logits.append(p)
+    # correct_results = {}
+    # incorrect_results = {}
 
-            for i, predictor in enumerate(predictors):
-                p = logits[i][bi]  # .unsqueeze(0)
+    # for i in range(len(predictors)):
+    #     mn = np.mean(correct[i])
+    #     std = np.std(correct[i])
+    #
+    #     correct_results[i] = {'mean': mn, 'std': std}
+    #
+    #     mn = np.mean(incorrect[i])
+    #     std = np.std(incorrect[i])
+    #
+    #     incorrect_results[i] = {'mean': mn, 'std': std}
 
-                if torch.argmax(p) == y[bi]:
-                    sf = nn.functional.softmax(p, -1)
-                    _h = -(sf + 1e-12).log() * sf
-                    # print(bi, i, h.sum())
-                    _h = _h / np.log(sf.shape[-1])
-                    _h = _h.sum()
-                    h[i].append(_h.item ())
-
-    # print(h)
-    threshold = [np.quantile(h[i], percentile) for i in range(len(h))]
-    # print(threshold)
-    # for k, hs in h.items():
-    #     print(k, np.quantile(hs, 0.5))
-    # return
-
-    for x, y in dataset_loader:
-        x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
-
-        logits = []
-
-        for i, predictor in enumerate(predictors):
-            if isinstance(predictor, BayesianHead):
-                p = predictor(logits=preds[i],
-                              branch_index=i, samples=samples)
-            else:
-                p = predictor(preds[i])
-
-            logits.append(p)
-
-        for bi in range(x.shape[0]):
-            found = False
-
-            for i, predictor in enumerate(predictors):
-                p = logits[i][bi]  # .unsqueeze(0)
-                sf = nn.functional.softmax(p, -1)
-                h = -(sf + 1e-12).log() * sf
-                # print(bi, i, h.sum())
-                h = h / np.log(sf.shape[-1])
-                h = h.sum()
-                if h < threshold[i]:
-                    top_classes = torch.topk(p, p.size(-1))[1]
-                    pred_labels[i].append(top_classes.tolist())
-                    true_labels[i].append(y[bi].item())
-                    exits_counter[i] += 1
-                    found = True
-                    break
-
-            if not found:
-                top_classes = \
-                    torch.topk(final_preds[bi], final_preds.size(-1))[1]
-                true_labels['final'].append(y[bi].item())
-                pred_labels['final'].append(top_classes.tolist())
-                exits_counter['final'] += 1
-
-        # true_labels = np.asarray(true_labels)
-        scores = {i: accuracy_score(true_labels[i], p, topk=topk)
-                  for i, p in pred_labels.items()}
-
-        all_labels = np.concatenate(
-            [true_labels[i] for i, p in pred_labels.items()])
-        all_preds = np.concatenate([p for i, p in pred_labels.items()], 0)
-
-        scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
-
-        # scores['branches_counter'] = exits_counter
-
-    return scores, exits_counter
-
-
-@torch.no_grad()
-def branches_binary(model: BranchModel,
-                    predictors: nn.ModuleList,
-                    binary_classifiers: Union[nn.ModuleList, BayesianPosterior],
-                    dataset_loader,
-                    threshold: Union[List[float], float] = None,
-                    device='cpu', samples=1, topk=None):
-    model.eval()
-    predictors.eval()
-    binary_classifiers.eval()
-
-    if threshold is None:
-        threshold = 0.5
-
-    if isinstance(threshold, float):
-        threshold = [threshold] * model.n_branches()
-
-    exits_counter = defaultdict(int)
-
-    true_labels = defaultdict(list)
-    pred_labels = defaultdict(list)
-
-    for x, y in dataset_loader:
-        x, y = x.to(device), y.to(device)
-        final_preds, preds = model(x)
-
-        hs = []
-        predictions = []
-
-        for i in range(len(binary_classifiers)):
-            logits = preds[i]
-
-            if isinstance(binary_classifiers, BayesianPosterior):
-                h = binary_classifiers(logits=logits,
-                                       samples=samples,
-                                       branch_index=i)
-            else:
-                binary_predictor = binary_classifiers[i]
-                h = binary_predictor(logits)
-
-            predictions.append(predictors[i](logits))
-            hs.append(h)
-
-        for bi in range(x.shape[0]):
-            found = False
-            for i in range(len(binary_classifiers)):
-                if hs[i][bi] >= threshold[i]:
-                    p = predictions[i][bi]
-                    top_classes = torch.topk(p, p.size(-1))[1]
-                    pred_labels[i].append(top_classes.tolist())
-                    true_labels[i].append(y[bi].item())
-                    exits_counter[i] += 1
-                    found = True
-                    break
-
-                # for i in range(len(binary_classifiers)):
-                #     logits = preds[i][bi].unsqueeze(0)
-                #
-                #     if isinstance(binary_classifiers, BayesianPosterior):
-                #         h = binary_classifiers(logits=logits,
-                #                                samples=samples,
-                #                                branch_index=i).squeeze(0)
-                #     else:
-                #         binary_predictor = binary_classifiers[i]
-                #         h = binary_predictor(logits).squeeze(0)
-                #
-                #     if h >= threshold[i]:
-                #         p = predictors[i](logits).squeeze(0)
-                #         top_classes = torch.topk(p, p.size(-1))[1]
-                #         pred_labels[i].append(top_classes.tolist())
-                #         true_labels[i].append(y[bi].item())
-                #         exits_counter[i] += 1
-                #         found = True
-                #         break
-
-            if not found:
-                top_classes = \
-                    torch.topk(final_preds[bi], final_preds.size(-1))[1]
-                true_labels['final'].append(y[bi].item())
-                pred_labels['final'].append(top_classes.tolist())
-                exits_counter['final'] += 1
-
-        # true_labels = np.asarray(true_labels)
-        scores = {i: accuracy_score(true_labels[i], p, topk=topk)
-                  for i, p in pred_labels.items()}
-
-        all_labels = np.concatenate(
-            [true_labels[i] for i, p in pred_labels.items() if len(p) > 0])
-        all_preds = np.concatenate([p for i, p in pred_labels.items() if len(p) > 0], 0)
-
-        scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
-
-        # scores['branches_counter'] = exits_counter
-
-    return scores, exits_counter
-
-
-def branches_mean(model: BranchModel,
-                  predictors: nn.ModuleList,
-                  posteriors: BayesianPosterior,
-                  dataset_loader,
-                  c=1,
-                  samples=1,
-                  threshold: Union[List[float], float] = None,
-                  device='cpu', topk=None):
-    model.eval()
-    predictors.eval()
-
-    if threshold is None:
-        threshold = 0.5
-
-    if isinstance(threshold, float):
-        threshold = [threshold] * model.n_branches()
-
-    exits_counter = defaultdict(int)
-
-    true_labels = defaultdict(list)
-    pred_labels = defaultdict(list)
-
-    with torch.no_grad():
-        for x, y in dataset_loader:
-            x, y = x.to(device), y.to(device)
-            final_preds, preds = model(x)
-
-            ps = [posteriors.get_posterior(branch_index=j, logits=bo)
-                  for j, bo in enumerate(preds)]
-
-            for bi in range(x.shape[0]):
-                found = False
-
-                for i in range(len(posteriors)):
-                    p = ps[i]
-                    mean, var = p.mean[bi], p.variance[bi]
-                    th = mean + c * var
-
-                    logits = preds[i][bi].unsqueeze(0)
-
-                    h = posteriors(logits=logits,
-                                   branch_index=i,
-                                   samples=samples).squeeze(0)
-
-                    if h >= th:
-                        p = predictors[i](logits).squeeze(0)
-                        top_classes = torch.topk(p, p.size(-1))[1]
-                        pred_labels[i].append(top_classes.tolist())
-                        true_labels[i].append(y[bi].item())
-                        exits_counter[i] += 1
-                        found = True
-                        break
-
-                if not found:
-                    top_classes = \
-                        torch.topk(final_preds[bi], final_preds.size(-1))[1]
-                    true_labels['final'].append(y[bi].item())
-                    pred_labels['final'].append(top_classes.tolist())
-                    exits_counter['final'] += 1
-
-        # true_labels = np.asarray(true_labels)
-        scores = {i: accuracy_score(true_labels[i], p, topk=topk)
-                  for i, p in pred_labels.items()}
-
-        all_labels = np.concatenate(
-            [true_labels[i] for i, p in pred_labels.items()])
-        all_preds = np.concatenate([p for i, p in pred_labels.items()], 0)
-
-        scores['global'] = accuracy_score(all_labels, all_preds, topk=topk)
-
-        # scores['branches_counter'] = exits_counter
-
-    return scores, exits_counter
+    return dict(correct), dict(incorrect)

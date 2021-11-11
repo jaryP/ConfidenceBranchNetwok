@@ -1,35 +1,39 @@
 import logging
-from collections import Sequence
-from itertools import chain
-from typing import List, Union
 
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Distribution, kl_divergence, Dirichlet
+from torch.distributions import kl_divergence, Bernoulli, \
+    ContinuousBernoulli, RelaxedBernoulli
+
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tqdm import tqdm
 
-from base.evaluators import standard_eval, branches_binary, branches_eval
-from base.utils import mmd
-from bayesian.bayesian_utils import compute_mmd, pdist
-from bayesian.posteriors import BayesianPosterior, BayesianHead, BayesianHeads, \
-    LayerEmbeddingBeta
-from models.base import BranchModel, branches_predictions
+from base.evaluators import standard_eval, branches_eval, binary_eval, \
+    binary_statistics
+from models.base import BranchModel
+from utils import get_device
+from copy import deepcopy
 
 
 def standard_trainer(model: BranchModel,
+                     predictors: nn.Module,
                      optimizer,
                      train_loader,
                      epochs,
                      scheduler=None,
                      early_stopping=None,
-                     test_loader=None, eval_loader=None, device='cpu'):
+                     test_loader=None, eval_loader=None):
+
+    device = get_device(model)
+
     scores = []
     mean_losses = []
 
     best_model = model.state_dict()
     best_model_i = 0
+    best_eval_score = -1
+
     model.to(device)
 
     if early_stopping is not None:
@@ -42,7 +46,9 @@ def standard_trainer(model: BranchModel,
         losses = []
         for i, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
-            pred, _ = model(x)
+            pred = model(x)[-1]
+            pred = predictors[-1].logits(pred)
+
             loss = nn.functional.cross_entropy(pred, y, reduction='none')
             losses.extend(loss.tolist())
             loss = loss.mean()
@@ -58,32 +64,47 @@ def standard_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
+            """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)"""
+            branches_scores = branches_eval(model, predictors, eval_loader)
+            # branches_scores = {k: v[1] for k, v in branches_scores.items()}
+            eval_scores = branches_scores['final']
         else:
-            eval_scores = 0
+            eval_scores = None
 
         mean_loss = sum(losses) / len(losses)
         mean_losses.append(mean_loss)
 
         if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
+            r = early_stopping.step(eval_scores) if eval_loader is not None \
                 else early_stopping.step(mean_loss)
 
             if r < 0:
                 break
             elif r > 0:
-                best_model = model.state_dict()
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
                 best_model_i = epoch
         else:
-            best_model = model.state_dict()
-            best_model_i = epoch
+            if (eval_scores is not None and eval_scores >= best_eval_score) \
+                    or eval_scores is None:
 
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
+                if eval_scores is not None:
+                    best_eval_score = eval_scores
 
-        # score_dict = {'Train score': train_scores, 'Test score': test_scores,
-        #               'Eval score': eval_scores if eval_scores != 0 else 0}
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
+                best_model_i = epoch
+
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1])
+
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1])
 
         bar.set_postfix(
             {'Train score': train_scores, 'Test score': test_scores,
@@ -92,7 +113,7 @@ def standard_trainer(model: BranchModel,
 
         scores.append((train_scores, eval_scores, test_scores))
 
-    return best_model, \
+    return (best_model, best_predictors), \
            scores, \
            scores[best_model_i] if len(scores) > 0 else 0, \
            mean_losses
@@ -105,14 +126,38 @@ def joint_trainer(model: BranchModel,
                   epochs,
                   scheduler=None,
                   weights=None,
+                  joint_type='logits',
                   early_stopping=None,
-                  test_loader=None, eval_loader=None, device='cpu'):
+                  test_loader=None, eval_loader=None):
+    device = get_device(model)
+
+    if joint_type not in ['losses', 'logits']:
+        raise ValueError
+
+    if weights is None:
+        weights = torch.tensor([1.0] * model.n_branches(), device=device)
+
+    # weights = torch.tensor([1.0] * model.n_branches(), device=device)
+
+    if not isinstance(weights, (torch.Tensor, torch.nn.Parameter)):
+        if isinstance(weights, (int, float)):
+            weights = torch.tensor([weights] * model.n_branches(),
+                                   device=device, dtype=torch.float)
+
+        else:
+            weights = torch.tensor(weights, device=device, dtype=torch.float)
+
+        if joint_type == 'logits':
+            weights = weights.unsqueeze(-1)
+            weights = weights.unsqueeze(-1)
+
     scores = []
     mean_losses = []
 
     best_model = model.state_dict()
     best_predictors = predictors.state_dict()
     best_model_i = 0
+    best_eval_score = -1
 
     model.to(device)
     predictors.to(device)
@@ -123,1012 +168,40 @@ def joint_trainer(model: BranchModel,
     model.train()
     bar = tqdm(range(epochs), leave=True)
     for epoch in bar:
-        model.train()
+
         losses = []
+
         for i, (x, y) in enumerate(train_loader):
             model.train()
             predictors.train()
 
             x, y = x.to(device), y.to(device)
-            final_pred, preds = model(x)
-            loss = nn.functional.cross_entropy(final_pred, y,
-                                               reduction='mean')
-            for i, p in enumerate(preds):
-                l = nn.functional.cross_entropy(predictors[i](p), y,
-                                                reduction='mean')
-                if weights is not None:
-                    l *= weights[i]
-                loss += l
 
-            losses.append(loss.item())
+            preds = model(x)
+            logits = []
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            for j, bo in enumerate(preds):
+                l = predictors[j].logits(bo)
+                logits.append(l)
 
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
+            preds = torch.stack(logits, 0)
 
-        if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
-        else:
-            eval_scores = 0
+            if joint_type == 'logits':
+                preds = weights * preds
+                f_hat = preds.sum(0)
 
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
+                loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
 
-        if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-                else early_stopping.step(mean_loss)
-
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = model.state_dict()
-                best_predictors = predictors.state_dict()
-                best_model_i = epoch
-        else:
-            best_predictors = predictors.state_dict()
-            best_model = model.state_dict()
-            best_model_i = epoch
-
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
-
-        bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss})
-        scores.append((train_scores, eval_scores, test_scores))
-
-    return (best_model, best_predictors), scores, scores[best_model_i] if len(
-        scores) > 0 else 0, mean_losses
-
-
-def output_combiner_trainer(model: BranchModel,
-                            predictors: nn.ModuleList,
-                            optimizer,
-                            train_loader,
-                            epochs,
-                            convex_combination=False,
-                            scheduler=None,
-                            weights=None,
-                            early_stopping=None,
-                            test_loader=None, eval_loader=None, device='cpu'):
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_predictors = predictors.state_dict()
-    best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    if weights is not None:
-        if not isinstance(weights, (torch.Tensor, torch.nn.Parameter)):
-            weights = torch.tensor(weights)
-
-        weights = weights.view(weights.shape[0], 1, 1).to(device)
-
-    model.train()
-    bar = tqdm(range(epochs), leave=True)
-    for epoch in bar:
-        model.train()
-        losses = []
-        for i, (x, y) in enumerate(train_loader):
-            model.train()
-            predictors.train()
-
-            x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
-
-            preds = [p(bo) for p, bo in zip(predictors, bos)]
-            # preds = torch.stack(preds, 0)
-
-            preds = torch.stack(preds + [final_pred], 0)
-
-            if weights is not None:
-                w = weights
-                if convex_combination:
-                    w = torch.softmax(w, 0)
-                preds = preds * w
-
-            pred = preds.sum(0)
-
-            loss = nn.functional.cross_entropy(pred, y, reduction='mean')
-
-            losses.append(loss.item())
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
-
-        if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
-        else:
-            eval_scores = 0
-
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
-
-        if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-                else early_stopping.step(mean_loss)
-
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = model.state_dict()
-                best_predictors = predictors.state_dict()
-                best_model_i = epoch
-        else:
-            best_model = model.state_dict()
-            best_predictors = predictors.state_dict()
-            best_model_i = epoch
-
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
-
-        bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss})
-        scores.append((train_scores, eval_scores, test_scores))
-
-    return (best_model, best_predictors), scores, scores[best_model_i] if len(
-        scores) > 0 else 0, mean_losses
-
-
-def binary_classifier_trainer(model: BranchModel,
-                              predictors: nn.ModuleList,
-                              binary_classifiers: nn.ModuleList,
-                              optimizer,
-                              train_loader,
-                              epochs,
-                              energy_w=1,
-                              scheduler=None,
-                              early_stopping=None,
-                              test_loader=None, eval_loader=None, device='cpu'):
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_predictors = predictors.state_dict()
-    best_binaries = binary_classifiers.state_dict()
-
-    best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    sample_image = next(iter(train_loader))[0][1:2].to(device)
-    costs = branches_predictions(model, predictors, sample_image)
-
-    model.train()
-    bar = tqdm(range(epochs), leave=True)
-    for epoch in bar:
-        model.train()
-        losses = []
-        for i, (x, y) in enumerate(train_loader):
-            model.train()
-            predictors.train()
-            binary_classifiers.train()
-
-            x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
-
-            hs = torch.stack([h(bo)
-                              for h, bo in zip(binary_classifiers, bos)], 0)
-
-            # if hs.min() < 0 or hs.max() > 1:
-            #     hs = torch.sigmoid(hs)
-
-            preds = [p(bo) for p, bo in zip(predictors, bos)]
-            preds = torch.stack(preds, 0)
-
-            f_hat = final_pred
-            gamma_hat = costs['final']
-
-            for i in reversed(range(0, len(preds))):
-                f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-                gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
-
-            # print(gamma_hat.mean())
-            # print(gamma_hat.mean())
-            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
-            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
-            # gamma_hat = costs['final']
-            # for i in reversed(range(0, len(preds))):
-            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
-            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
-            # print(gamma_hat.mean())
-            gamma_hat = gamma_hat.mean() * energy_w
-
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-            # print(gamma_hat, loss)
-            loss += gamma_hat
-
-            losses.append(loss.item())
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # s = branches_eval(model, predictors, test_loader, device=device)
-        # print('Branches scores {}'.format(s))
-
-        # s, c = branches_binary(model=model,
-        #                        binary_classifiers=binary_classifiers,
-        #                        dataset_loader=test_loader,
-        #                        predictors=predictors,
-        #                        threshold=0.5,
-        #                        device=device)
-        #
-        # print(s, c)
-
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
-
-        if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
-        else:
-            eval_scores = 0
-
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
-
-        if early_stopping is not None:
-            # r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-            #     else early_stopping.step(mean_loss)
-            r = early_stopping.step(mean_loss)
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = model.state_dict()
-                best_predictors = predictors.state_dict()
-                best_binaries = binary_classifiers.state_dict()
-
-                best_model_i = epoch
-        else:
-            best_model = model.state_dict()
-            best_predictors = predictors.state_dict()
-            best_binaries = binary_classifiers.state_dict()
-
-            best_model_i = epoch
-
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
-
-        branches_scores = branches_eval(model, predictors, test_loader,
-                                        device=device)
-        branches_scores = {k: v[1] for k, v in branches_scores.items()}
-
-        s, c = branches_binary(model=model,
-                               binary_classifiers=binary_classifiers,
-                               dataset_loader=test_loader,
-                               predictors=predictors,
-                               threshold=0.5,
-                               device=device)
-
-        s = {k: v[1] for k, v in s.items()}
-        print(s, c)
-        bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss, 'Branch test scores': branches_scores,
-             's': s, 'c': c})
-
-        scores.append((train_scores, eval_scores, test_scores))
-
-    return (best_model, best_predictors, best_binaries), \
-           scores, scores[best_model_i], mean_losses
-
-
-def posterior_classifier_trainer(model: BranchModel,
-                                 predictors: nn.ModuleList,
-                                 posteriors: BayesianPosterior,
-                                 optimizer,
-                                 train_loader,
-                                 epochs,
-                                 prior: Union[Distribution, List[Distribution]],
-                                 prior_w=1,
-                                 energy_w=1e-8,
-                                 use_mmd=True,
-                                 scheduler=None,
-                                 early_stopping=None,
-                                 test_loader=None, eval_loader=None,
-                                 cumulative_prior=False,
-                                 device='cpu'):
-    if not isinstance(prior, list):
-        if not cumulative_prior:
-            prior = [prior] * len(predictors)
-    else:
-        cumulative_prior = False
-
-    sample_image = next(iter(train_loader))[0][1:2].to(device)
-    costs = branches_predictions(model, predictors, sample_image)
-    print(costs)
-
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    model.train()
-    bar = tqdm(range(epochs), leave=True)
-    for epoch in bar:
-        model.train()
-        losses = []
-        for i, (x, y) in enumerate(train_loader):
-            model.train()
-            posteriors.train()
-            predictors.train()
-
-            x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
-
-            hs = torch.stack([posteriors(branch_index=j, logits=bo)
-                              for j, bo
-                              in enumerate(bos)], 0)
-
-            ps = [posteriors.get_posterior(branch_index=j,
-                                           logits=bo)
-                  for j, bo
-                  in enumerate(bos)]
-
-            preds = [p(bo) for p, bo in zip(predictors, bos)]
-            preds = torch.stack(preds, 0)
-
-            f_hat = final_pred
-            gamma_hat = costs['final']
-
-            for i in reversed(range(0, len(preds))):
-                f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-                gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
-
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-            losses.append(loss.item())
-
-            gamma_hat = gamma_hat.mean() * energy_w
-            loss += gamma_hat
-
-            kl = 0
-
-            if cumulative_prior:
-                s = torch.cat([p.rsample() for i, p in enumerate(ps)], 0)
-                sp = prior.sample(s.size()).to(device)
-                kl = mmd(s, sp)
             else:
-                for pi, p in enumerate(ps):
-                    if use_mmd:
-                        s = p.rsample()
-                        kl += mmd(s, prior[pi].sample(s.size()).to(s.device))
-                    else:
-                        kl += kl_divergence(p, prior[pi]).mean()
+                loss = torch.stack(
+                    [nn.functional.cross_entropy(p, y, reduction='mean')
+                     for p in preds[:-1]], 0)
 
-            klw = 2 ** (len(train_loader) - i - 1) \
-                  / (2 ** len(train_loader) - 1)
-            kl *= prior_w  # * klw
+                loss = loss * weights[:-1]
+                loss = loss.sum()
 
-            loss += kl
-
-            # pairwise_kl = 0
-            # for p in range(len(ps) - 1):
-            #     # pairwise_kl += kl_divergence(ps[p], ps[p+1])
-            #     # pairwise_kl += compute_mmd(ps[p].rsample([1, 100]),
-            #     #                    ps[p+1].sample([1, 100]))
-            #     pairwise_kl += torch.pow(ps[p].rsample([100]) -
-            #                              ps[p + 1].sample([100]), 2).sum([1, 2])
-            #
-            # pairwise_kl = pairwise_kl.mean()
-            #
-            # # print(pairwise_kl, end='... ')
-            # pairwise_kl = 1 / pairwise_kl.mean()
-            # # pairwise_kl *= 1e-6
-            # # print(pairwise_kl)
-            #
-            # loss += pairwise_kl
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # for optimizer.
-            # for n, p in posteriors.named_parameters():
-            #     print(n, p.grad)
-
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
-
-        if eval_loader is not None:
-            eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-                                           device=device)
-        else:
-            eval_scores = 0
-
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
-
-        if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-                else early_stopping.step(mean_loss)
-
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = model.state_dict()
-                best_model_i = epoch
-        else:
-            best_model = model.state_dict()
-            best_model_i = epoch
-
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
-
-        bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss})
-        scores.append((train_scores, eval_scores, test_scores))
-
-    return best_model, scores, scores[best_model_i], mean_losses
-
-
-# def posterior_regularization_trainer(model: BranchModel,
-#                                      predictors: nn.ModuleList,
-#                                      posteriors: BayesianPosterior,
-#                                      optimizer,
-#                                      train_loader,
-#                                      epochs,
-#                                      prior: Union[
-#                                          Distribution, List[Distribution]],
-#                                      kl_divergence_w=1,
-#                                      scheduler=None,
-#                                      early_stopping=None,
-#                                      test_loader=None, eval_loader=None,
-#                                      device='cpu'):
-#     if not isinstance(prior, list):
-#         prior = [prior] * len(predictors)
-#
-#     scores = []
-#     mean_losses = []
-#
-#     best_model = model.state_dict()
-#     best_model_i = 0
-#
-#     model.to(device)
-#     predictors.to(device)
-#
-#     if early_stopping is not None:
-#         early_stopping.reset()
-#
-#     model.train()
-#     bar = tqdm(range(epochs), leave=True)
-#     for epoch in bar:
-#         model.train()
-#         losses = []
-#         for i, (x, y) in enumerate(train_loader):
-#             model.train()
-#             posteriors.train()
-#             predictors.train()
-#
-#             x, y = x.to(device), y.to(device)
-#             final_pred, bos = model(x)
-#
-#             hs = torch.stack([posteriors(branch_index=i, logits=bo)
-#                               for i, bo
-#                               in enumerate(bos)], 0)
-#
-#             # hs = hs.to(device)
-#             # if hs.min() < 0 or hs.max() > 1:
-#             #     hs = torch.sigmoid(hs)
-#
-#             preds = [p(bo) for p, bo in zip(predictors, bos)]
-#             preds = torch.stack(preds + [final_pred], 0)
-#
-#             f_hat = preds[-1]
-#             for i in reversed(range(0, len(preds) - 1)):
-#                 f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-#
-#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-#
-#             ps = [posteriors.get_posterior(branch_index=i,
-#                                            logits=bo)
-#                   for i, bo
-#                   in enumerate(bos)]
-#
-#             kl = 0
-#             for i, p in enumerate(ps):
-#                 print('BETA', i,
-#                       p.concentration1.shape,
-#                       p.concentration1[0],
-#                       p.concentration0[0],
-#                       hs[i][0],
-#                       kl_divergence(p, prior[i]).mean())
-#
-#                 kl += kl_divergence(p, prior[i]).mean()
-#             kl *= kl_divergence_w
-#
-#             print(kl)
-#
-#             loss += kl
-#
-#             losses.append(loss.item())
-#
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#
-#             # for optimizer.
-#             # for n, p in posteriors.named_parameters():
-#             #     print(n, p.grad)
-#
-#         if scheduler is not None:
-#             if isinstance(scheduler, (StepLR, MultiStepLR)):
-#                 scheduler.step()
-#             elif hasattr(scheduler, 'step'):
-#                 scheduler.step()
-#
-#         if eval_loader is not None:
-#             eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-#                                            device=device)
-#         else:
-#             eval_scores = 0
-#
-#         mean_loss = sum(losses) / len(losses)
-#         mean_losses.append(mean_loss)
-#
-#         if early_stopping is not None:
-#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-#                 else early_stopping.step(mean_loss)
-#
-#             if r < 0:
-#                 break
-#             elif r > 0:
-#                 best_model = model.state_dict()
-#                 best_model_i = epoch
-#         else:
-#             best_model = model.state_dict()
-#             best_model_i = epoch
-#
-#         train_scores = standard_eval(model, train_loader, device=device)
-#         test_scores = standard_eval(model, test_loader, device=device)
-#
-#         bar.set_postfix(
-#             {'Train score': train_scores, 'Test score': test_scores,
-#              'Eval score': eval_scores if eval_scores != 0 else 0,
-#              'Mean loss': mean_loss})
-#         scores.append((train_scores, eval_scores, test_scores))
-#
-#     return best_model, scores, scores[best_model_i], mean_losses
-
-
-def binary_posterior_joint_trainer(model: BranchModel,
-                                   predictors: nn.ModuleList,
-                                   posteriors: BayesianPosterior,
-                                   optimizer,
-                                   train_loader,
-                                   epochs,
-                                   prior: Union[
-                                       Distribution, List[Distribution]],
-                                   prior_w=1,
-                                   energy_w=1e-3,
-                                   use_mmd=True,
-                                   scheduler=None,
-                                   early_stopping=None,
-                                   test_loader=None, eval_loader=None,
-                                   cumulative_prior=False,
-                                   device='cpu'):
-    if not isinstance(prior, list):
-        if not cumulative_prior:
-            prior = [prior] * len(predictors)
-    else:
-        cumulative_prior = False
-
-    sample_image = next(iter(train_loader))[0][1:2].to(device)
-    costs = branches_predictions(model, predictors, sample_image)
-
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    model.train()
-    bar = tqdm(range(epochs), leave=True)
-    for epoch in bar:
-        model.train()
-        losses = []
-        for i, (x, y) in enumerate(train_loader):
-            model.train()
-            posteriors.train()
-            predictors.train()
-
-            x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
-
-            hs = torch.stack([posteriors(branch_index=j, logits=bo)
-                              for j, bo
-                              in enumerate(bos)], 0)
-
-            ps = [posteriors.get_posterior(branch_index=j,
-                                           logits=bo)
-                  for j, bo
-                  in enumerate(bos)]
-
-            # hs = hs.to(device)
-            # if hs.min() < 0 or hs.max() > 1:
-            #     hs = torch.sigmoid(hs)
-
-            preds = torch.stack([p(bo) * h for p, bo, h in
-                                 zip(predictors, bos, hs)])
-
-            preds = preds.sum(0) + final_pred
-            # preds = torch.stack(preds + [final_pred], 0)
-            #
-            f_hat = preds[-1]
-            gamma_hat = costs['final']
-
-            for pi in reversed(range(0, len(preds) - 1)):
-                f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
-                gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
-
-            gamma_loss = gamma_hat * energy_w
-            loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-
-            kl = 0
-
-            if cumulative_prior:
-                s = torch.cat([p.rsample() for i, p in enumerate(ps)], 0)
-                sp = prior.sample(s.size()).to(device)
-                kl = mmd(s, sp)
-            else:
-                for pi, p in enumerate(ps):
-                    # a, b = p.concentration1.mean(0), p.concentration0.mean(0)
-                    # m = a / (a + b)
-                    # std = (a * b) / ((a + b)**2 * (a + b + 1))
-                    # print('BETA', i,
-                    #       p.concentration1.mean(0).item(),
-                    #       p.concentration0.mean(0).item(),
-                    #       hs[i].mean(0).item(), hs[i].std(0).item(),
-                    #       kl_divergence(p, prior[i]).mean().item(),
-                    #       m, std)
-                    # print(mmd(s, prior[i].sample(s.size()).to(s.device)))
-                    if use_mmd:
-                        s = p.rsample()
-                        kl += mmd(s, prior[pi].sample(s.size()).to(s.device))
-                    else:
-                        kl += kl_divergence(p, prior[pi]).mean()
-
-            # a = 0
-            # for pi in range(len(ps) - 1):
-            #     # a += kl_divergence(ps[pi], ps[pi + 1]).sum()
-            #     a += torch.pow(hs[pi] - hs[pi + 1], 2).mean()
-            # # print(a, 1 / a)
-            # a = 1 / a
-
-            klw = 2 ** (len(train_loader) - i - 1) \
-                  / (2 ** len(train_loader) - 1)
-
-            kl *= prior_w * klw
-
-            losses.append(loss.item())
-
-            loss += kl + gamma_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # for optimizer.
-            # for n, p in posteriors.named_parameters():
-            #     print(n, p.grad)
-
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
-
-        if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
-        else:
-            eval_scores = 0
-
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
-
-        if early_stopping is not None:
-            r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-                else early_stopping.step(mean_loss)
-
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = model.state_dict()
-                best_model_i = epoch
-        else:
-            best_model = model.state_dict()
-            best_model_i = epoch
-
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
-
-        bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss})
-        scores.append((train_scores, eval_scores, test_scores))
-
-    return best_model, scores, scores[best_model_i], mean_losses
-
-
-# def posterior_classifier_trainer(model: BranchModel,
-#                                  predictors: nn.ModuleList,
-#                                  posteriors: BayesianPosterior,
-#                                  optimizer,
-#                                  train_loader,
-#                                  epochs,
-#                                  prior: Union[Distribution, List[Distribution]],
-#                                  prior_w=1,
-#                                  entropy_w=1,
-#                                  use_mmd=True,
-#                                  scheduler=None,
-#                                  early_stopping=None,
-#                                  test_loader=None, eval_loader=None,
-#                                  cumulative_prior=False,
-#                                  device='cpu'):
-#     if not isinstance(prior, list):
-#         if not cumulative_prior:
-#             prior = [prior] * len(predictors)
-#     else:
-#         cumulative_prior = False
-#
-#     scores = []
-#     mean_losses = []
-#
-#     best_model = model.state_dict()
-#     best_predictors = predictors.state_dict()
-#     best_posteriors = posteriors.state_dict()
-#     best_model_i = 0
-#
-#     model.to(device)
-#     predictors.to(device)
-#
-#     if early_stopping is not None:
-#         early_stopping.reset()
-#
-#     model.train()
-#     bar = tqdm(range(epochs), leave=True)
-#     for epoch in bar:
-#         model.train()
-#         losses = []
-#
-#         for i, (x, y) in enumerate(train_loader):
-#             model.train()
-#             posteriors.train()
-#             predictors.train()
-#
-#             x, y = x.to(device), y.to(device)
-#             final_pred, bos = model(x)
-#
-#             hs = torch.stack([posteriors(branch_index=j, logits=bo)
-#                               for j, bo
-#                               in enumerate(bos)], 0)
-#             # hs = hs.to(device)
-#             # if hs.min() < 0 or hs.max() > 1:
-#             #     hs = torch.sigmoid(hs)
-#
-#             preds = [p(bo) for p, bo in zip(predictors, bos)]
-#             preds = torch.stack(preds + [final_pred], 0)
-#
-#             f_hat = preds[-1]
-#             for pi in reversed(range(0, len(preds) - 1)):
-#                 f_hat = hs[pi] * preds[pi] + (1 - hs[pi]) * f_hat
-#
-#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-#
-#             ps = [posteriors.get_posterior(branch_index=j,
-#                                            logits=bo)
-#                   for j, bo
-#                   in enumerate(bos)]
-#
-#             kl = 0
-#
-#             if cumulative_prior:
-#                 s = torch.cat([p.rsample() for i, p in enumerate(ps)], 0)
-#                 sp = prior.sample(s.size()).to(device)
-#                 kl = mmd(s, sp)
-#             else:
-#                 for pi, p in enumerate(ps):
-#                     # a, b = p.concentration1.mean(0), p.concentration0.mean(0)
-#                     # m = a / (a + b)
-#                     # std = (a * b) / ((a + b)**2 * (a + b + 1))
-#                     # print('BETA', i,
-#                     #       p.concentration1.mean(0).item(),
-#                     #       p.concentration0.mean(0).item(),
-#                     #       hs[i].mean(0).item(), hs[i].std(0).item(),
-#                     #       kl_divergence(p, prior[i]).mean().item(),
-#                     #       m, std)
-#                     # print(mmd(s, prior[i].sample(s.size()).to(s.device)))
-#                     if use_mmd:
-#                         s = p.rsample()
-#                         # kl += mmd(s, prior[pi].sample(s.size()).to(s.device))
-#                         kl += compute_mmd(s, prior[pi].sample(s.size()).to(
-#                             s.device))
-#                     else:
-#                         kl += kl_divergence(p, prior[pi]).mean()
-#
-#             klw = 2 ** (len(train_loader) - i - 1) \
-#                   / (2 ** len(train_loader) - 1)
-#
-#             kl *= prior_w
-#
-#             h = torch.stack([p.entropy().mean(0) for p in ps])
-#
-#             if i == 0:
-#                 print(h)
-#
-#             h = torch.sum(h) * entropy_w
-#
-#             reg = (h + kl) * klw
-#             loss += reg
-#
-#             losses.append(loss.item())
-#
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#
-#             # for optimizer.
-#             # for n, p in posteriors.named_parameters():
-#             #     print(n, p.grad)
-#
-#         ps = [posteriors.get_posterior(branch_index=j,
-#                                        logits=bo)
-#               for j, bo
-#               in enumerate(bos)]
-#         h = [p.entropy().mean(0).item() for p in ps]
-#         print(epoch, h)
-#
-#         if scheduler is not None:
-#             if isinstance(scheduler, (StepLR, MultiStepLR)):
-#                 scheduler.step()
-#             elif hasattr(scheduler, 'step'):
-#                 scheduler.step()
-#
-#         if eval_loader is not None:
-#             eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-#                                         device=device)
-#         else:
-#             eval_scores = 0
-#
-#         mean_loss = sum(losses) / len(losses)
-#         mean_losses.append(mean_loss)
-#
-#         if early_stopping is not None:
-#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-#                 else early_stopping.step(mean_loss)
-#             if r < 0:
-#                 break
-#             elif r > 0:
-#                 best_model = model.state_dict()
-#                 best_predictors = predictors.state_dict()
-#                 best_posteriors = posteriors.state_dict()
-#                 best_model_i = epoch
-#         else:
-#             best_model = model.state_dict()
-#             best_predictors = predictors.state_dict()
-#             best_posteriors = posteriors.state_dict()
-#             best_model_i = epoch
-#
-#         train_scores = standard_eval(model, train_loader, device=device)
-#         test_scores = standard_eval(model, test_loader, device=device)
-#
-#         bar.set_postfix(
-#             {'Train score': train_scores, 'Test score': test_scores,
-#              'Eval score': eval_scores if eval_scores != 0 else 0,
-#              'Mean loss': mean_loss})
-#         scores.append((train_scores, eval_scores, test_scores))
-#
-#     return (best_model, best_predictors, best_posteriors), \
-#            scores, scores[best_model_i], mean_losses
-
-
-def bayesian_joint_trainer(model: BranchModel,
-                           predictors: BayesianHeads,
-                           optimizer,
-                           train_loader,
-                           epochs,
-                           scheduler=None,
-                           weights=None,
-                           early_stopping=None,
-                           samples=1,
-                           prior_w=1,
-                           test_loader=None,
-                           eval_loader=None,
-                           device='cpu'):
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_predictors = predictors.state_dict()
-    best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    model.train()
-    bar = tqdm(range(epochs), leave=True)
-    for epoch in bar:
-
-        losses = []
-        for i, (x, y) in enumerate(train_loader):
-            batch_w = 2 ** (len(train_loader) - i - 1) \
-                      / (2 ** len(train_loader) - 1)
-
-            model.train()
-            predictors.train()
-
-            x, y = x.to(device), y.to(device)
-            final_pred, preds = model(x)
-            # loss = nn.functional.cross_entropy(final_pred, y,
-            #                                    reduction='mean')
-            loss = 0
-            for i, p in enumerate(preds):
-                o, prior_loss = predictors(logits=p, branch_index=i,
-                                           samples=samples)
-                l = nn.functional.cross_entropy(o, y,
-                                                reduction='mean')
-                l = l + prior_loss * prior_w * batch_w
-                # print(l)
-
-                if weights is not None:
-                    l *= weights[i]
-
-                loss += l
+                loss += nn.functional.cross_entropy(preds[-1], y,
+                                                    reduction='mean')
 
             losses.append(loss.item())
 
@@ -1143,418 +216,188 @@ def bayesian_joint_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
+            """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)"""
+            branches_scores = branches_eval(model, predictors, eval_loader)
+            eval_scores = branches_scores['final']
+            # branches_scores = {k: v[1] for k, v in branches_scores.items()}
+
         else:
-            eval_scores = 0
+            eval_scores = None
 
         mean_loss = sum(losses) / len(losses)
         mean_losses.append(mean_loss)
 
         if early_stopping is not None:
-            """ r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-                else early_stopping.step(mean_loss)"""
-            r = early_stopping.step(mean_loss)
+            print(early_stopping.current_value, eval_scores,
+                  early_stopping.tolerance)
+
+            r = early_stopping.step(eval_scores) if eval_loader is not None \
+                else early_stopping.step(mean_loss)
+
             if r < 0:
                 break
             elif r > 0:
-                best_model = model.state_dict()
-                best_predictors = predictors.state_dict()
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
                 best_model_i = epoch
         else:
-            best_predictors = predictors.state_dict()
-            best_model = model.state_dict()
-            best_model_i = epoch
+            print(eval_scores, best_eval_score)
 
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
+            if (eval_scores is not None and eval_scores >= best_eval_score) \
+                    or eval_scores is None:
 
-        branches_scores = branches_eval(model, predictors, test_loader,
-                                        device=device)
-        print(branches_scores)
-        branches_scores = {k: v[1] for k, v in branches_scores.items()}
+                if eval_scores is not None:
+                    best_eval_score = eval_scores
+
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
+                best_model_i = epoch
+
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1])
+
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1])
+
+        scores.append(test_scores)
 
         bar.set_postfix(
             {'Train score': train_scores, 'Test score': test_scores,
              'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss, 'Branch scores': branches_scores})
+             'Mean loss': mean_loss})
         scores.append((train_scores, eval_scores, test_scores))
 
     return (best_model, best_predictors), scores, scores[best_model_i] if len(
         scores) > 0 else 0, mean_losses
 
 
-# def posterior_regularization_trainer(model: BranchModel,
-#                                      predictors: nn.ModuleList,
-#                                      posteriors: BayesianPosterior,
-#                                      optimizer,
-#                                      train_loader,
-#                                      epochs,
-#                                      prior: Union[
-#                                          Distribution, List[Distribution]],
-#                                      kl_divergence_w=1,
-#                                      scheduler=None,
-#                                      early_stopping=None,
-#                                      test_loader=None, eval_loader=None,
-#                                      device='cpu'):
-#     if not isinstance(prior, list):
-#         prior = [prior] * len(predictors)
-#
-#     scores = []
-#     mean_losses = []
-#
-#     best_model = model.state_dict()
-#     best_model_i = 0
-#
-#     model.to(device)
-#     predictors.to(device)
-#
-#     if early_stopping is not None:
-#         early_stopping.reset()
-#
-#     model.train()
-#     bar = tqdm(range(epochs), leave=True)
-#     for epoch in bar:
-#         model.train()
-#         losses = []
-#         for i, (x, y) in enumerate(train_loader):
-#             model.train()
-#             posteriors.train()
-#             predictors.train()
-#
-#             x, y = x.to(device), y.to(device)
-#             final_pred, bos = model(x)
-#
-#             hs = torch.stack([posteriors(branch_index=i, logits=bo)
-#                               for i, bo
-#                               in enumerate(bos)], 0)
-#
-#             # hs = hs.to(device)
-#             # if hs.min() < 0 or hs.max() > 1:
-#             #     hs = torch.sigmoid(hs)
-#
-#             preds = [p(bo) for p, bo in zip(predictors, bos)]
-#             preds = torch.stack(preds + [final_pred], 0)
-#
-#             f_hat = preds[-1]
-#             for i in reversed(range(0, len(preds) - 1)):
-#                 f_hat = hs[i] * preds[i] + (1 - hs[i]) * f_hat
-#
-#             loss = nn.functional.cross_entropy(f_hat, y, reduction='mean')
-#
-#             ps = [posteriors.get_posterior(branch_index=i,
-#                                            logits=bo)
-#                   for i, bo
-#                   in enumerate(bos)]
-#
-#             kl = 0
-#             for i, p in enumerate(ps):
-#                 print('BETA', i,
-#                       p.concentration1.shape,
-#                       p.concentration1[0],
-#                       p.concentration0[0],
-#                       hs[i][0],
-#                       kl_divergence(p, prior[i]).mean())
-#
-#                 kl += kl_divergence(p, prior[i]).mean()
-#             kl *= kl_divergence_w
-#
-#             print(kl)
-#
-#             loss += kl
-#
-#             losses.append(loss.item())
-#
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#
-#             # for optimizer.
-#             # for n, p in posteriors.named_parameters():
-#             #     print(n, p.grad)
-#
-#         if scheduler is not None:
-#             if isinstance(scheduler, (StepLR, MultiStepLR)):
-#                 scheduler.step()
-#             elif hasattr(scheduler, 'step'):
-#                 scheduler.step()
-#
-#         if eval_loader is not None:
-#             eval_scores, _ = standard_eval(model, eval_loader, topk=[1, 5],
-#                                            device=device)
-#         else:
-#             eval_scores = 0
-#
-#         mean_loss = sum(losses) / len(losses)
-#         mean_losses.append(mean_loss)
-#
-#         if early_stopping is not None:
-#             r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-#                 else early_stopping.step(mean_loss)
-#
-#             if r < 0:
-#                 break
-#             elif r > 0:
-#                 best_model = model.state_dict()
-#                 best_model_i = epoch
-#         else:
-#             best_model = model.state_dict()
-#             best_model_i = epoch
-#
-#         train_scores = standard_eval(model, train_loader, device=device)
-#         test_scores = standard_eval(model, test_loader, device=device)
-#
-#         bar.set_postfix(
-#             {'Train score': train_scores, 'Test score': test_scores,
-#              'Eval score': eval_scores if eval_scores != 0 else 0,
-#              'Mean loss': mean_loss})
-#         scores.append((train_scores, eval_scores, test_scores))
-#
-#     return best_model, scores, scores[best_model_i], mean_losses
+def adaptive_trainer(model: BranchModel,
+                     predictors: nn.ModuleList,
+                     optimizer,
+                     train_loader,
+                     epochs,
+                     scheduler=None,
+                     early_stopping=None,
+                     test_loader=None,
+                     eval_loader=None,
+                     reg_w=1):
+    # def classification_loss(logits, ground_truth, confidence_scores,
+    #                         drop=False):
+    #     if normalize_weights:
+    #         a, b = torch.split(confidence_scores,
+    #                            [confidence_scores.shape[1] - 1, 1],
+    #                            dim=1)
+    #
+    #         c = torch.cumprod(1 - a, 1)
+    #
+    #         cat = torch.cat((torch.ones_like(b), c), 1)
+    #         confidence_scores = confidence_scores * cat
+    #
+    #     if joint_type == 'logits':
+    #         if normalize_weights:
+    #             p1, p2 = torch.split(logits,
+    #                                  [logits.shape[1] - 1, 1],
+    #                                  dim=1)
+    #
+    #             d1, _ = torch.split(confidence_scores,
+    #                                 [logits.shape[1] - 1, 1],
+    #                                 dim=1)
+    #
+    #             p1 = p1 * d1
+    #             f_hat = p1.sum(1)
+    #             p2 = p2.squeeze()
+    #
+    #             loss = nn.functional.cross_entropy(f_hat, ground_truth,
+    #                                                reduction='mean')
+    #             loss += nn.functional.cross_entropy(p2, ground_truth,
+    #                                                 reduction='mean')
+    #
+    #         else:
+    #             logits = logits * confidence_scores
+    #             f_hat = torch.sum(logits, 1)
+    #             # f_hat /= distributions.sum(1)
+    #
+    #             loss = nn.functional.cross_entropy(f_hat, ground_truth,
+    #                                                reduction='mean')
+    #     else:
+    #
+    #         loss = torch.stack(
+    #             [nn.functional.cross_entropy(logits[:, pi], ground_truth,
+    #                                          reduction='none')
+    #              for pi in range(preds.shape[1])], -1)
+    #
+    #         confidence_scores = confidence_scores.squeeze()
+    #         loss = loss * confidence_scores
+    #
+    #         loss = loss.mean(0)
+    #         loss = loss.sum()
+    #
+    #     return loss
 
+    log = logging.getLogger(__name__)
 
-def branching_trainer(model: BranchModel,
-                      predictors: nn.ModuleList,
-                      binary_classifiers: LayerEmbeddingBeta,
-                      optimizer,
-                      train_loader,
-                      epochs,
-                      one_hot=False,
-                      energy_reg=1,
-                      samples=1,
-                      scheduler=None,
-                      early_stopping=None,
-                      test_loader=None, eval_loader=None, device='cpu'):
-    logger = logging.getLogger(__name__)
+    device = get_device(model)
+    model.to(device)
+    predictors.to(device)
 
     scores = []
     mean_losses = []
 
     best_model = model.state_dict()
     best_predictors = predictors.state_dict()
-    best_binaries = binary_classifiers.state_dict()
 
     best_model_i = 0
-
-    model.to(device)
-    predictors.to(device)
+    best_eval_score = -1
 
     if early_stopping is not None:
         early_stopping.reset()
 
-    sample_image = next(iter(train_loader))[0][1:2].to(device)
-    costs_d = branches_predictions(model, predictors, sample_image)
-
-    costs = torch.empty(len(costs_d), device=device)
-    for k, v in costs_d.items():
-        if k == 'final':
-            k = len(costs_d) - 1
-        costs[k] = v
-    # print(costs)
-    # print(1/costs, nn.functional.softmax((-costs)/2))
-
-    costs = nn.functional.softmax(-costs, 0)
-    p = [10, 8, 5.0, 3, 1.5, 1.5]
-    # p = costs.tolist()
-    prior = Dirichlet(torch.tensor(p, device=device))
-
-    logger.info('Prior parameters: {}'.format(p))
-    logger.info('Prior means: {}'.format(prior.mean.tolist()))
-    logger.info('Prior variances: {}'.format(prior.variance.tolist()))
-
-    logger.info('Prior costs: {}'.format(costs))
-    costs = costs.unsqueeze(-1).unsqueeze(-1)
-
     bar = tqdm(range(epochs), leave=True)
+    costs_dict = model.computational_cost(next(iter(train_loader))[0])
+    costs = np.asarray(list(costs_dict.values()))
+    costs /= costs[-1]
 
     for epoch in bar:
+
+        model.train()
+        predictors.train()
 
         losses = []
         kl_losses = []
 
-        for i, (x, y) in enumerate(train_loader):
-
-            model.train()
-            predictors.train()
-            binary_classifiers.train()
+        for bi, (x, y) in tqdm(enumerate(train_loader), leave=False,
+                               total=len(train_loader)):
 
             x, y = x.to(device), y.to(device)
-            final_pred, bos = model(x)
 
-            hs = torch.stack([binary_classifiers(branch_index=j, logits=bo,
-                                                 samples=samples)
-                              for j, bo
-                              in enumerate(bos)], 0)
-            hs = torch.cat(
-                (hs, torch.ones(1, final_pred.size(0), 1, device=device)), 0)
+            bos = model(x)
 
-            # print(hs[:, 10].tolist())
-            #
-            # ps = [binary_classifiers.get_posterior(branch_index=j,
-            #                                        logits=bo).concentration0[10].item()
-            #       for j, bo
-            #       in enumerate(bos)]
-            #
-            # print(ps)
+            distributions, logits = [], []
 
-            # mask = torch.zeros_like(hs)
-            # mask[0] = 1
+            for j, bo in enumerate(bos):
+                l, b = predictors[j](bo)
+                distributions.append(b)
+                logits.append(l)
 
-            # posteriors = torch.stack([binary_classifiers.get_posterior(branch_index=j, logits=bo)
-            #                   for j, bo
-            #                   in enumerate(bos)], 0)
-            # print(hs.mean(1))
+            y_output = logits[-1]
 
-            # ones = torch.ones((1, hs.size(1), 1), device=device)
-            # hs = torch.cat((hs, ones), 0)
+            for y_b, gate in zip(logits[-2::-1], distributions[-2::-1]):
+                y_output = y_b * gate + (1 - gate) * y_output
 
-            # hs[0, :] = 1
-            # cp = torch.cumprod(1 - hs, 0)[1:, :]
-            # print(cp[1:, 10])
+            loss = nn.functional.cross_entropy(y_output, y, reduction='mean') +\
+                   nn.functional.cross_entropy(logits[-1], y, reduction='mean')
 
-            a, b = torch.split(hs, [len(hs) - 1, 1], 0)
+            avg_cost = torch.ones((x.shape[0], 1)).to(x.device)
 
-            cp = torch.cumprod(1 - a, 0)
+            for cost_i, conf_i in zip(costs[-2::-1], distributions[-2::-1]):
+                avg_cost = conf_i * cost_i + (1 - conf_i) * avg_cost
 
-            ones = torch.ones((1, cp.size(1), 1), device=device)
-            cp = torch.cat((ones, cp), 0)
-            hs = hs * cp
-
-            # print(kl)
-            # kl = torch.nn.functional.kl_div(hs.transpose(0, 1).squeeze(-1),
-            #                                 prior_sample,
-            #                                 reduction='batchmean')
-
-            # print(cp[:, 10])
-            # print(hs[:, 10].tolist())
-            # print(hs.mean(1).tolist(), hs.std(1).tolist())
-            # print()
-
-            # print(hs[:, 10], hs[:, 10].sum())
-            # input()
-
-            # _hs = torch.zeros_like(hs) * mask + hs * (1 - mask)
-            # print(_hs[:, 10])
-
-            # cp = torch.cumprod(1 - _hs, 0)
-            # print(cp[:, 10])
-            # cp = torch.roll(cp, 0, 1)
-            # cp = cp * hs
-            # # cp1 = torch.roll(torch.cumprod(1 - hs, 0), 0, 1)
-            #
-            # #  We use a mask because the first value should not be changed
-            #
-            # hs = hs * mask + cp * (1 - mask)
-            # print(hs[:, 10], hs[:, 10].sum())
-            # input()
-
-            # print(cp.sum(0)[0])
-            # a = cp1[:, 0]
-            # b = hs[:, 0]
-            # b = a.sum()
-            # prova = 0
-
-            # cp = hs
-            # cp[1:] = hs[1:] * torch.cumprod(1 - hs[:-1], -1)
-            # print(torch.cumprod(1 - hs[:-1], -1)[0, 0])
-
-            # if hs.min() < 0 or hs.max() > 1:
-            #     hs = torch.sigmoid(hs)
-
-            # print(hs[:, 0:2].tolist())
-
-            # preds = [p(bo) for p, bo in zip(predictors, bos)] + [final_pred]
-            # preds = torch.stack(preds, 0)
-            # preds = preds * hs
-            # f_hat = preds.sum(0)  # + final_pred
-
-            def gaussian_kernel(a, b):
-                dim1_1, dim1_2 = a.shape[0], b.shape[0]
-                depth = a.shape[1]
-                a = a.view(dim1_1, 1, depth)
-                b = b.view(1, dim1_2, depth)
-                a_core = a.expand(dim1_1, dim1_2, depth)
-                b_core = b.expand(dim1_1, dim1_2, depth)
-                numerator = (a_core - b_core).pow(2).mean(2) / depth
-                return torch.exp(-numerator)
-
-            def mmd(x, y):
-                x_kernel = gaussian_kernel(x, x)
-                y_kernel = gaussian_kernel(y, y)
-                xy_kernel = gaussian_kernel(x, y)
-                return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
-
-            costs_loss = 0
-            if energy_reg > 0:
-                prior_sample = prior.sample([hs.size(1)])
-                _hs = hs
-                a = mmd(_hs.transpose(0, 1).squeeze(-1), prior_sample)
-                # print(a)
-                #
-                # # print(prior_sample[0], hs.transpose(0, 1)[0])
-                # _hs = hs.contiguous().transpose(0, 1)
-                # a = compute_mmd(_hs, prior_sample.unsqueeze(-1))
-                # print(a.shape)
-                kl = a
-                # print(a.mean())
-
-                # a = pdist(hs.transpose(0, 1).squeeze(-1).unsqueeze(1), prior_sample.unsqueeze(1))
-                # input(a.shape)
-                # prior_sample = costs
-                #
-                # _hs = hs.transpose(0, 1).squeeze(-1)
-                # div = _hs / prior_sample
-                # div = div.log()
-                # kl = _hs * div
-                # kl = kl.sum(1)
-                # kl = kl.mean()
-                # print(kl)
-
-                costs_loss = kl * energy_reg
-                kl_losses.append(costs_loss.item())
-            else:
-                kl_losses.append(costs_loss)
-            # print(costs_loss)
-
-            # f_hat = final_pred
-            #
-            # gamma_hat = costs['final']
-            # for i in reversed(range(0, len(preds))):
-            #     f_hat = cp[i] * preds[i] + (1 - cp[i]) * f_hat
-            #     # gamma_hat = hs[i] * costs[i] + (1 - hs[i]) * gamma_hat
-            #
-            # print(gamma_hat.mean())
-            # print(gamma_hat.mean())
-            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
-            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
-            # gamma_hat = costs['final']
-            # for i in reversed(range(0, len(preds))):
-            # for y_b, y_c in zip(preds[-2::-1], hs[-2::-1]):
-            #     f_hat = y_c * y_b + (1 - y_c[i]) * f_hat
-            # print(gamma_hat.mean())
-            # gamma_hat = gamma_hat.mean() * energy_w
-
-            if one_hot:
-                index = hs.max(dim=0, keepdims=True)[1]
-                hs_hard = torch.zeros_like(hs).scatter_(0, index, 1.0)
-                hs = hs_hard - hs.detach() + hs
-                # print(hs_hard.shape, hs_hard[:, 0:2].tolist())
-
-            alls = [p(bo) for p, bo in zip(predictors, bos)] + [final_pred]
-            loss = torch.stack([nn.functional.cross_entropy(p, y,
-                                                            reduction='none')
-                                for p in alls], 0)
-            loss = loss * hs.squeeze(-1)
-            loss = loss.mean(-1).sum(0)
-            # # # print(loss.shape, hs.shape)
-            # #
-            # loss = loss.mean(1).mean()
-            # print(loss)
-
-            loss += costs_loss
-
-            # print(gamma_hat, loss)
-            # loss += gamma_hat
+            loss = loss + reg_w * torch.mean(avg_cost)
 
             losses.append(loss.item())
 
@@ -1562,14 +405,7 @@ def branching_trainer(model: BranchModel,
             loss.backward()
             optimizer.step()
 
-            # for n, m in chain(model.named_parameters(),
-            #       predictors.named_parameters(),
-            #       binary_classifiers.named_parameters()):
-            #     print(n, getattr(m, 'grad', None) is None)
-            # input()
-
-        # s = branches_eval(model, predictors, test_loader, device=device)
-        # print('Branches scores {}'.format(s))
+        mean_loss = np.mean(losses)
 
         if scheduler is not None:
             if isinstance(scheduler, (StepLR, MultiStepLR)):
@@ -1578,59 +414,673 @@ def branching_trainer(model: BranchModel,
                 scheduler.step()
 
         if eval_loader is not None:
-            eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)
-        else:
-            eval_scores = 0
+            """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)"""
+            branches_scores = branches_eval(model, predictors, eval_loader)
+            eval_scores = np.mean([v for k, v in branches_scores.items()])
 
-        mean_loss = sum(losses) / len(losses)
-        mean_losses.append(mean_loss)
-        mean_kl_loss = sum(kl_losses) / len(kl_losses)
+        else:
+            eval_scores = None
 
         if early_stopping is not None:
-            # r = early_stopping.step(eval_scores[1]) if eval_loader is not None \
-            #     else early_stopping.step(mean_loss)
-            r = early_stopping.step(mean_loss)
+            r = early_stopping.step(eval_scores) if eval_loader is not None \
+                else early_stopping.step(mean_loss)
+            print(early_stopping.current_value, eval_scores)
+
             if r < 0:
                 break
             elif r > 0:
-                best_model = model.state_dict()
-                best_predictors = predictors.state_dict()
-                best_binaries = binary_classifiers.state_dict()
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
 
                 best_model_i = epoch
+
         else:
-            best_model = model.state_dict()
-            best_predictors = predictors.state_dict()
-            best_binaries = binary_classifiers.state_dict()
+            if (eval_scores is not None and eval_scores >= best_eval_score) \
+                    or eval_scores is None:
+                print(best_eval_score, eval_scores)
 
-            best_model_i = epoch
+                if eval_scores is not None:
+                    best_eval_score = eval_scores
 
-        train_scores = standard_eval(model, train_loader, device=device)
-        test_scores = standard_eval(model, test_loader, device=device)
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
 
-        branches_scores = branches_eval(model, predictors, test_loader,
-                                        device=device)
-        branches_scores = {k: v[1] for k, v in branches_scores.items()}
+                best_model_i = epoch
 
-        s, c = branches_binary(model=model,
-                               binary_classifiers=binary_classifiers,
-                               dataset_loader=test_loader,
-                               predictors=predictors,
-                               threshold=0.5,
-                               device=device)
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1])
 
-        s = {k: v.get(1, 0) for k, v in s.items()}
-        print(s, c)
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1])
 
+        scores.append(test_scores)
+
+        s = branches_eval(model=model,
+                          dataset_loader=test_loader,
+                          predictors=predictors)
+        s = dict(s)
+        print(s)
+
+        correct_stats, incorrect_stats = \
+            binary_statistics(model=model,
+                              dataset_loader=test_loader,
+                              predictors=predictors)
+
+        print([(k, np.mean(v), np.std(v))
+               for k, v in correct_stats.items()])
+        print([(k, np.mean(v), np.std(v))
+               for k, v in incorrect_stats.items()])
+
+        for epsilon in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
+                        0.7, 0.8, 0.9, 0.95, 0.98]:
+            # for epsilon in [0.9]:
+            prior_gt, b = binary_eval(model=model,
+                                      dataset_loader=test_loader,
+                                      predictors=predictors,
+                                      epsilon=[0.7 if epsilon <= 0.7
+                                               else epsilon]
+                                              + ([epsilon] * (
+                                                  model.n_branches() - 1)),
+                                      cumulative_threshold=False)
+
+            prior_gt, b = dict(prior_gt), dict(b)
+
+            s = '\tEpsilon {}. '.format(epsilon)
+            for k in sorted([k for k in prior_gt.keys() if k != 'global']):
+                s += 'B: {}, S: {}, C: {}. '.format(k,
+                                                    np.round(prior_gt[k]
+                                                             * 100,
+                                                             2),
+                                                    b[k])
+            s += 'GS: {}'.format(prior_gt['global'])
+
+            print(s)
+
+        mean_kl_loss = np.mean(kl_losses)
+        mean_losses.append(mean_loss)
         bar.set_postfix(
-            {'Train score': train_scores, 'Test score': test_scores,
-             'Eval score': eval_scores if eval_scores != 0 else 0,
-             'Mean loss': mean_loss, 'KL loss': mean_kl_loss,
-             'Branch test scores': branches_scores,
-             's': s, 'c': c})
+            {
+                'Train score': train_scores, 'Test score': test_scores,
+                'Eval score': eval_scores if eval_scores != 0 else 0,
+                'Mean loss': mean_loss
+            })
 
-        scores.append((train_scores, eval_scores, test_scores))
+    return (best_model, best_predictors), \
+           scores, scores[best_model_i], mean_losses
 
-    return (best_model, best_predictors, best_binaries), \
+
+def binary_bernulli_trainer(model: BranchModel,
+                            predictors: nn.ModuleList,
+                            optimizer,
+                            train_loader,
+                            epochs,
+                            prior_parameters,
+                            beta=1e-3,
+                            joint_type='logits',
+                            sample=True,
+                            scheduler=None,
+                            early_stopping=None,
+                            test_loader=None,
+                            eval_loader=None,
+                            recursive=False,
+                            fix_last_layer=False,
+                            normalize_weights=True,
+                            prior_mode='ones',
+                            regularization_loss='bce',
+                            temperature_scaling=True,
+                            regularization_scaling=False,
+                            dropout=0,
+                            backbone_epochs=0):
+    def classification_loss(logits, ground_truth, confidence_scores,
+                            drop=False):
+        if normalize_weights:
+            a, b = torch.split(confidence_scores,
+                               [confidence_scores.shape[1] - 1, 1],
+                               dim=1)
+
+            c = torch.cumprod(1 - a, 1)
+
+            cat = torch.cat((torch.ones_like(b), c), 1)
+            confidence_scores = confidence_scores * cat
+
+        if joint_type == 'logits':
+            if normalize_weights:
+                p1, p2 = torch.split(logits,
+                                     [logits.shape[1] - 1, 1],
+                                     dim=1)
+
+                d1, _ = torch.split(confidence_scores,
+                                    [logits.shape[1] - 1, 1],
+                                    dim=1)
+
+                p1 = p1 * d1
+                f_hat = p1.sum(1)
+                p2 = p2.squeeze()
+
+                loss = nn.functional.cross_entropy(f_hat, ground_truth,
+                                                   reduction='mean')
+                loss += nn.functional.cross_entropy(p2, ground_truth,
+                                                    reduction='mean')
+
+            else:
+                logits = logits * confidence_scores
+                f_hat = torch.sum(logits, 1)
+                # f_hat /= distributions.sum(1)
+
+                loss = nn.functional.cross_entropy(f_hat, ground_truth,
+                                                   reduction='mean')
+        else:
+
+            loss = torch.stack(
+                [nn.functional.cross_entropy(logits[:, pi], ground_truth,
+                                             reduction='none')
+                 for pi in range(preds.shape[1])], -1)
+
+            confidence_scores = confidence_scores.squeeze()
+            loss = loss * confidence_scores
+
+            loss = loss.mean(0)
+            loss = loss.sum()
+
+        return loss
+
+    log = logging.getLogger(__name__)
+
+    device = get_device(model)
+    model.to(device)
+    predictors.to(device)
+
+    if joint_type not in ['losses', 'logits']:
+        raise ValueError
+
+    if prior_mode not in ['entropy', 'ones', 'probability']:
+        raise ValueError
+
+    scores = []
+    mean_losses = []
+
+    best_model = model.state_dict()
+    best_predictors = predictors.state_dict()
+
+    best_model_i = 0
+    best_eval_score = -1
+
+    if early_stopping is not None:
+        early_stopping.reset()
+
+    model.train()
+
+    # epochs = epochs + backbone_epochs
+
+    bar = tqdm(range(epochs), leave=True)
+
+    if temperature_scaling and sample:
+        # temperatures = [np.exp(-10 * i / epochs)
+        #                 for i in range(epochs // 3)]
+        # temperatures += [0] * (epochs - len(temperatures))
+
+        temperatures = [20 / (2 ** i) for i in range(epochs)]
+        temperatures = [5 if t < 5 else t for t in temperatures]
+
+        log.info('Temperature scaling: {}'.format(temperatures))
+    else:
+        temperatures = [1] * epochs
+
+    if regularization_scaling:
+        prior_weights = [0] * (epochs // 5)
+        prior_weights += list(
+            np.linspace(0.1, 1, (epochs - len(prior_weights)) + 1))
+        log.info('Regularization scaling: {}'.format(prior_weights))
+    else:
+        prior_weights = [1] * epochs
+
+    for epoch in bar:
+
+        model.train()
+        predictors.train()
+
+        losses = []
+        kl_losses = []
+
+        current_temperature = temperatures[epoch]
+        current_prior_w = prior_weights[epoch]
+
+        for bi, (x, y) in tqdm(enumerate(train_loader), leave=False,
+                               total=len(train_loader)):
+
+            x, y = x.to(device), y.to(device)
+
+            with torch.no_grad():
+                bos = model(x)
+
+            # if backbone_epochs > 0:
+            #     if epoch > backbone_epochs:
+            #         with torch.no_grad():
+            #             bos = model(x)
+            #     else:
+            #         bos = model(x)
+            #         current_prior_w = 0
+            # else:
+            #     bos = model(x)
+
+            distributions, logits = [], []
+
+            for j, bo in enumerate(bos):
+                l, b = predictors[j](bo)
+                distributions.append(b)
+                logits.append(l)
+
+            preds = torch.stack(logits, 1)
+            distributions = torch.stack(distributions, 1)
+
+            reg_term = 0
+
+            if beta > 0 and current_prior_w > 0:
+
+                weights = None
+
+                with torch.no_grad():
+                    if prior_mode == 'probability':
+                        _y = y.unsqueeze(-1).expand(-1,
+                                                    distributions.shape[1]) \
+                            .unsqueeze(-1)
+                        sf = torch.softmax(preds, -1)
+
+                        prior_gt = torch.gather(sf, -1, _y)
+
+                    elif prior_mode == 'entropy':
+                        sf = torch.softmax(preds, -1)
+                        h = -(sf + 1e-12).log() * sf
+                        h = h / np.log(sf.shape[-1])
+                        h = h.sum(-1)
+                        prior_gt = 1 - h
+                        prior_gt = prior_gt.unsqueeze(-1)
+
+                    elif prior_mode == 'ones':
+                        _y = y.unsqueeze(1)
+                        mx = torch.argmax(preds, -1)
+                        prior_gt = (mx == _y).float()
+                        prior_gt = prior_gt.unsqueeze(-1)
+
+                        # prior_gt_flat = torch.flatten(prior_gt, 0)
+                        # tot = prior_gt_flat.shape[0]
+                        #
+                        # ones = prior_gt_flat.sum(0)
+                        # zeros = tot - ones
+                        #
+                        # w1 = tot / (2 * ones)
+                        #
+                        # w2 = tot / (2 * zeros)
+                        #
+                        # weights = w1 * prior_gt_flat + \
+                        #           w2 * (1 - prior_gt_flat)
+                        #
+                        # weights = torch.nan_to_num(weights, 1)
+                        #
+                        # weights = weights.view(mx.shape).unsqueeze(-1)
+
+                        tot = preds.shape[0]
+                        ones = prior_gt.sum(0)
+                        zeros = tot - ones
+
+                        w1 = tot / (2 * ones)
+                        torch.nan_to_num_(w1, 0)
+                        w1 = w1.unsqueeze(0).expand(tot, -1, -1)
+
+                        w2 = tot / (2 * zeros)
+                        torch.nan_to_num_(w2, 0)
+
+                        w2 = w2.unsqueeze(0).expand(tot, -1, -1)
+
+                        weights = w1 * prior_gt + w2 * (1 - prior_gt)
+
+                # d = torch.clamp(distributions, 1e-8, 1 - 1e-8)
+                # d = distributions
+
+                # if fix_last_layer:
+                #     d = d[:, :-1]
+                #
+                #     if weights is not None:
+                #         weights = weights[:, :-1]
+                #
+                #     bce = nn.functional.binary_cross_entropy(
+                #         d, prior_gt[:, :-1],
+                #         reduction='none', weight=weights)
+                # else:
+
+                reg_term = nn.functional.binary_cross_entropy(
+                    torch.clamp(distributions, 1e-4, 1 - 1e-4),
+                    prior_gt,
+                    reduction='none',
+                    weight=weights)
+
+                # reg_term = nn.functional.mse_loss(distributions,
+                #                              prior_gt,
+                #                              reduction='none')
+
+                # reg_term = torch.abs(d - prior_gt)
+
+                if fix_last_layer:
+                    reg_term = reg_term[:, :-1]
+
+                # bce = torch.abs(d - prior_gt)
+                # bce = torch.sqrt(bce)
+                # print(bce.mean(), prior_gt.mean())
+
+                reg_term = reg_term.mean()
+                # print(reg_term)
+
+                reg_term *= beta
+
+                kl_losses.append(reg_term.item())
+
+            else:
+                kl_losses.append(0)
+
+            if sample and current_temperature > 0:
+                distributions = RelaxedBernoulli(current_temperature,
+                                                 distributions).rsample()
+
+                if fix_last_layer:
+                    distributions[:, -1] = 1
+            #
+            # if recursive:
+            #     assert False
+            #
+            #     _pred = []
+            #
+            #     y_output = preds[:, -1]
+            #
+            #     for i in range(preds.shape[1] - 1, -1, -1):
+            #         y_b = preds[:, i]
+            #         y_c = distributions[:, i]
+            #
+            #         y_output = y_b * y_c + (1 - y_c) * y_output
+            #
+            #     loss = nn.functional.cross_entropy(y_output, y,
+            #                                        reduction='mean')
+            #
+            # else:
+            #
+            #     # drop = torch.full(distributions.shape[:2], 0.5,
+            #     #                   device=device)
+            #     #
+            #     # mask = torch.bernoulli(drop).unsqueeze(-1)
+            #     # distributions = mask * distributions
+            #     #
+            #     # if fix_last_layer:
+            #     #     distributions[:, -1] = 1
+            #     #
+            #
+            #     if dropout > 0:
+            #         with torch.no_grad():
+            #             assert dropout < 1
+            #             # a = torch.quantile(distributions, 0.5, 1)
+            #             # distributions[distributions > a] = 0
+            #
+            #             # drop = torch.full(distributions.shape[:2], dropout,
+            #             #                   device=device) .unsqueeze(-1)
+            #             # mask = torch.bernoulli(drop).unsqueeze(-1)
+            #
+            #             mask = torch.bernoulli(1 - distributions)
+            #
+            #             if fix_last_layer:
+            #                 mask[:, -1] = 1
+            #
+            #             distributions = mask * distributions
+            #
+            #     if normalize_weights:
+            #         a, b = torch.split(distributions,
+            #                            [distributions.shape[1] - 1, 1],
+            #                            dim=1)
+            #
+            #         c = torch.cumprod(1 - a, 1)
+            #
+            #         cat = torch.cat((torch.ones_like(b), c), 1)
+            #         distributions = distributions * cat
+            #
+            #     if joint_type == 'logits':
+            #         # preds = preds * distributions
+            #         #
+            #         # f_hat = torch.sum(preds, 1)
+            #         # # f_hat /= distributions.sum(1)
+            #         #
+            #         # loss = nn.functional.cross_entropy(f_hat, y,
+            #         #                                    reduction='mean')
+            #         if normalize_weights:
+            #             p1, p2 = torch.split(preds,
+            #                                  [preds.shape[1] - 1, 1],
+            #                                  dim=1)
+            #
+            #             d1, _ = torch.split(distributions,
+            #                                 [preds.shape[1] - 1, 1],
+            #                                 dim=1)
+            #
+            #             p1 = p1 * d1
+            #
+            #             # if dropout > 0:
+            #             #     f_hat = p1.sum(1) + p2.squeeze()
+            #             #     loss = nn.functional.cross_entropy(f_hat, y,
+            #             #                                        reduction='mean')
+            #             # else:
+            #             f_hat = p1.sum(1)
+            #             p2 = p2.squeeze()
+            #
+            #             loss = nn.functional.cross_entropy(f_hat, y,
+            #                                                reduction='mean')
+            #             loss += nn.functional.cross_entropy(p2, y,
+            #                                                 reduction='mean')
+            #
+            #         else:
+            #             # preds = torch.cumsum(preds, 1)
+            #             #
+            #             # loss = torch.stack(
+            #             #     [nn.functional.cross_entropy(preds[:, p], y,
+            #             #                                  reduction='none')
+            #             #      for p in range(preds.shape[1])], -1)
+            #             #
+            #             # loss = loss.mean(0)
+            #             # loss = loss.sum()
+            #
+            #             preds = preds * distributions
+            #
+            #             f_hat = torch.sum(preds, 1)
+            #             # f_hat /= distributions.sum(1)
+            #
+            #             loss = nn.functional.cross_entropy(f_hat, y,
+            #                                                reduction='mean')
+            #
+            #     else:
+            #
+            #         loss = torch.stack(
+            #             [nn.functional.cross_entropy(preds[:, p], y,
+            #                                          reduction='none')
+            #              for p in range(preds.shape[1])], -1)
+            #
+            #         distributions = 1 - distributions.squeeze()
+            #         loss = loss * distributions
+            #
+            #         loss = loss.mean(0)
+            #         loss = loss.sum()
+
+            if dropout > 0:
+                with torch.no_grad():
+                    assert dropout < 1
+
+                    # if epoch < epochs // 2:
+                    #     drop = torch.full_like(distributions.shape[:2] + (1, ),
+                    #                            dropout)
+                    #     mask = torch.bernoulli(drop).unsqueeze(-1)
+                    # else:
+                    mask = torch.bernoulli(1 - distributions)
+
+                    if fix_last_layer:
+                        mask[:, -1] = 1
+
+                    distributions = mask * distributions
+
+            loss = classification_loss(preds, y, distributions, drop=True)
+
+            losses.append(loss.item())
+
+            # loss = (1 - 0.3) * loss + 0.3 * kl
+            # loss = (1 - kl_w[bi]) * loss + kl_w[bi] * kl
+            # loss = (1 - beta) * loss + beta * kl
+            # loss = (1 - kl_w[epoch]) * loss + kl_w[epoch] * kl
+
+            # loss = loss + kl_w[bi] * kl
+
+            loss = loss + (reg_term * current_prior_w)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        mean_loss = np.mean(losses)
+
+        if scheduler is not None:
+            if isinstance(scheduler, (StepLR, MultiStepLR)):
+                scheduler.step()
+            elif hasattr(scheduler, 'step'):
+                scheduler.step()
+
+        if eval_loader is not None:
+            """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
+                                        device=device)"""
+            branches_scores = branches_eval(model, predictors, eval_loader)
+            # print(branches_scores)
+
+            # eval_loss = 0
+            # tot = 0
+            #
+            # model.eval()
+            # predictors.eval()
+            #
+            # with torch.no_grad():
+            #     for x, y in eval_loader:
+            #         tot += x.shape[0]
+            #
+            #         x, y = x.to(device), y.to(device)
+            #
+            #         bos = model(x)
+            #
+            #         distributions, logits = [], []
+            #
+            #         for j, bo in enumerate(bos):
+            #             l, b = predictors[j](bo)
+            #             distributions.append(b)
+            #             logits.append(l)
+            #
+            #         preds = torch.stack(logits, 1)
+            #         distributions = torch.stack(distributions, 1)
+            #
+            #         loss = classification_loss(preds, y, distributions)
+            #
+            #         eval_loss += loss.sum().item()
+            #
+            # eval_loss = eval_loss / tot
+            # # print(eval_loss)
+            # eval_scores = eval_loss
+
+            # if current_prior_w > 0:
+            #     eval_scores = np.mean([v for k, v in branches_scores.items()])
+            # else:
+            eval_scores = branches_scores['final']
+
+        else:
+            eval_scores = None
+
+        if early_stopping is not None:
+            r = early_stopping.step(eval_scores) if eval_loader is not None \
+                else early_stopping.step(mean_loss)
+            print(early_stopping.current_value, eval_scores)
+
+            if r < 0:
+                break
+            elif r > 0:
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
+                best_model_i = epoch
+
+        else:
+            if (eval_scores is not None and eval_scores >= best_eval_score) \
+                    or eval_scores is None:
+                print(best_eval_score, eval_scores)
+
+                if eval_scores is not None:
+                    best_eval_score = eval_scores
+
+                best_model = deepcopy(model.state_dict())
+                best_predictors = deepcopy(predictors.state_dict())
+
+                best_model_i = epoch
+
+        train_scores = standard_eval(model=model,
+                                     dataset_loader=train_loader,
+                                     classifier=predictors[-1])
+
+        test_scores = standard_eval(model=model,
+                                    dataset_loader=test_loader,
+                                    classifier=predictors[-1])
+
+        scores.append(test_scores)
+
+        s = branches_eval(model=model,
+                          dataset_loader=test_loader,
+                          predictors=predictors)
+        s = dict(s)
+        print(s)
+
+        if current_prior_w > 0:
+            correct_stats, incorrect_stats = \
+                binary_statistics(model=model,
+                                  dataset_loader=test_loader,
+                                  predictors=predictors)
+
+            print([(k, np.mean(v), np.std(v))
+                   for k, v in correct_stats.items()])
+            print([(k, np.mean(v), np.std(v))
+                   for k, v in incorrect_stats.items()])
+
+            for epsilon in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
+                            0.7, 0.8, 0.9, 0.95, 0.98]:
+                # for epsilon in [0.9]:
+                prior_gt, b = binary_eval(model=model,
+                                          dataset_loader=test_loader,
+                                          predictors=predictors,
+                                          epsilon=[0.7 if epsilon <= 0.7
+                                                   else epsilon] + ([epsilon]
+                                                                    * (
+                                                                            model.n_branches() - 1)),
+                                          cumulative_threshold=
+                                          normalize_weights)
+
+                prior_gt, b = dict(prior_gt), dict(b)
+
+                s = '\tEpsilon {}. '.format(epsilon)
+                for k in sorted([k for k in prior_gt.keys() if k != 'global']):
+                    s += 'B: {}, S: {}, C: {}. '.format(k,
+                                                        np.round(prior_gt[k]
+                                                                 * 100,
+                                                                 2),
+                                                        b[k])
+                s += 'GS: {}'.format(prior_gt['global'])
+
+                print(s)
+
+        mean_kl_loss = np.mean(kl_losses)
+        mean_losses.append(mean_loss)
+        bar.set_postfix(
+            {
+                't': current_temperature, 'w': current_prior_w,
+                'Train score': train_scores, 'Test score': test_scores,
+                'Eval score': eval_scores if eval_scores != 0 else 0,
+                'Mean loss': mean_loss, 'mean kl loss': mean_kl_loss
+            })
+
+    return (best_model, best_predictors), \
            scores, scores[best_model_i], mean_losses

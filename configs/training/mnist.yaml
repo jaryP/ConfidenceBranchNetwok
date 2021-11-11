@@ -1,9 +1,4 @@
-dataset: mnist
-model: lenet-5
-epochs: 10
-batch_size: 64
-eval: 0.1
-experiments: 2
-early_stopping:
-  tolerance: 10
-  value: eval
+epochs: 5
+batch_size: 32
+device: 0
+eval_split: 0.1

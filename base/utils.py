@@ -9,6 +9,7 @@ from torchvision import datasets
 from torchvision.transforms import transforms
 
 from models.alexnet import AlexNet
+from models.vgg import vgg11
 
 
 def gaussian_kernel(a, b, gamma=None):
@@ -100,6 +101,8 @@ def get_model(name, input_size=None, output=None):
         #         if m.bias is not None:
         #             if m.bias.sum() == 0:
         #                 m.bias = None
+    elif 'vgg11' in name:
+        model = vgg11(pretrained=False, num_classes=output)
     # elif 'resnet' in name:
     #     if name == 'resnet20':
     #         model = resnet20(num_classes=output)
