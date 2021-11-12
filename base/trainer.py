@@ -3,8 +3,7 @@ import logging
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import kl_divergence, Bernoulli, \
-    ContinuousBernoulli, RelaxedBernoulli
+from torch.distributions import RelaxedBernoulli
 
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tqdm import tqdm
@@ -220,7 +219,6 @@ def joint_trainer(model: BranchModel,
                                         device=device)"""
             branches_scores = branches_eval(model, predictors, eval_loader)
             eval_scores = branches_scores['final']
-            # branches_scores = {k: v[1] for k, v in branches_scores.items()}
 
         else:
             eval_scores = None
@@ -276,242 +274,6 @@ def joint_trainer(model: BranchModel,
         scores) > 0 else 0, mean_losses
 
 
-def adaptive_trainer(model: BranchModel,
-                     predictors: nn.ModuleList,
-                     optimizer,
-                     train_loader,
-                     epochs,
-                     scheduler=None,
-                     early_stopping=None,
-                     test_loader=None,
-                     eval_loader=None,
-                     reg_w=1):
-    # def classification_loss(logits, ground_truth, confidence_scores,
-    #                         drop=False):
-    #     if normalize_weights:
-    #         a, b = torch.split(confidence_scores,
-    #                            [confidence_scores.shape[1] - 1, 1],
-    #                            dim=1)
-    #
-    #         c = torch.cumprod(1 - a, 1)
-    #
-    #         cat = torch.cat((torch.ones_like(b), c), 1)
-    #         confidence_scores = confidence_scores * cat
-    #
-    #     if joint_type == 'logits':
-    #         if normalize_weights:
-    #             p1, p2 = torch.split(logits,
-    #                                  [logits.shape[1] - 1, 1],
-    #                                  dim=1)
-    #
-    #             d1, _ = torch.split(confidence_scores,
-    #                                 [logits.shape[1] - 1, 1],
-    #                                 dim=1)
-    #
-    #             p1 = p1 * d1
-    #             f_hat = p1.sum(1)
-    #             p2 = p2.squeeze()
-    #
-    #             loss = nn.functional.cross_entropy(f_hat, ground_truth,
-    #                                                reduction='mean')
-    #             loss += nn.functional.cross_entropy(p2, ground_truth,
-    #                                                 reduction='mean')
-    #
-    #         else:
-    #             logits = logits * confidence_scores
-    #             f_hat = torch.sum(logits, 1)
-    #             # f_hat /= distributions.sum(1)
-    #
-    #             loss = nn.functional.cross_entropy(f_hat, ground_truth,
-    #                                                reduction='mean')
-    #     else:
-    #
-    #         loss = torch.stack(
-    #             [nn.functional.cross_entropy(logits[:, pi], ground_truth,
-    #                                          reduction='none')
-    #              for pi in range(preds.shape[1])], -1)
-    #
-    #         confidence_scores = confidence_scores.squeeze()
-    #         loss = loss * confidence_scores
-    #
-    #         loss = loss.mean(0)
-    #         loss = loss.sum()
-    #
-    #     return loss
-
-    log = logging.getLogger(__name__)
-
-    device = get_device(model)
-    model.to(device)
-    predictors.to(device)
-
-    scores = []
-    mean_losses = []
-
-    best_model = model.state_dict()
-    best_predictors = predictors.state_dict()
-
-    best_model_i = 0
-    best_eval_score = -1
-
-    if early_stopping is not None:
-        early_stopping.reset()
-
-    bar = tqdm(range(epochs), leave=True)
-    costs_dict = model.computational_cost(next(iter(train_loader))[0])
-    costs = np.asarray(list(costs_dict.values()))
-    costs /= costs[-1]
-
-    for epoch in bar:
-
-        model.train()
-        predictors.train()
-
-        losses = []
-        kl_losses = []
-
-        for bi, (x, y) in tqdm(enumerate(train_loader), leave=False,
-                               total=len(train_loader)):
-
-            x, y = x.to(device), y.to(device)
-
-            bos = model(x)
-
-            distributions, logits = [], []
-
-            for j, bo in enumerate(bos):
-                l, b = predictors[j](bo)
-                distributions.append(b)
-                logits.append(l)
-
-            y_output = logits[-1]
-
-            for y_b, gate in zip(logits[-2::-1], distributions[-2::-1]):
-                y_output = y_b * gate + (1 - gate) * y_output
-
-            loss = nn.functional.cross_entropy(y_output, y, reduction='mean') +\
-                   nn.functional.cross_entropy(logits[-1], y, reduction='mean')
-
-            avg_cost = torch.ones((x.shape[0], 1)).to(x.device)
-
-            for cost_i, conf_i in zip(costs[-2::-1], distributions[-2::-1]):
-                avg_cost = conf_i * cost_i + (1 - conf_i) * avg_cost
-
-            loss = loss + reg_w * torch.mean(avg_cost)
-
-            losses.append(loss.item())
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        mean_loss = np.mean(losses)
-
-        if scheduler is not None:
-            if isinstance(scheduler, (StepLR, MultiStepLR)):
-                scheduler.step()
-            elif hasattr(scheduler, 'step'):
-                scheduler.step()
-
-        if eval_loader is not None:
-            """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
-                                        device=device)"""
-            branches_scores = branches_eval(model, predictors, eval_loader)
-            eval_scores = np.mean([v for k, v in branches_scores.items()])
-
-        else:
-            eval_scores = None
-
-        if early_stopping is not None:
-            r = early_stopping.step(eval_scores) if eval_loader is not None \
-                else early_stopping.step(mean_loss)
-            print(early_stopping.current_value, eval_scores)
-
-            if r < 0:
-                break
-            elif r > 0:
-                best_model = deepcopy(model.state_dict())
-                best_predictors = deepcopy(predictors.state_dict())
-
-                best_model_i = epoch
-
-        else:
-            if (eval_scores is not None and eval_scores >= best_eval_score) \
-                    or eval_scores is None:
-                print(best_eval_score, eval_scores)
-
-                if eval_scores is not None:
-                    best_eval_score = eval_scores
-
-                best_model = deepcopy(model.state_dict())
-                best_predictors = deepcopy(predictors.state_dict())
-
-                best_model_i = epoch
-
-        train_scores = standard_eval(model=model,
-                                     dataset_loader=train_loader,
-                                     classifier=predictors[-1])
-
-        test_scores = standard_eval(model=model,
-                                    dataset_loader=test_loader,
-                                    classifier=predictors[-1])
-
-        scores.append(test_scores)
-
-        s = branches_eval(model=model,
-                          dataset_loader=test_loader,
-                          predictors=predictors)
-        s = dict(s)
-        print(s)
-
-        correct_stats, incorrect_stats = \
-            binary_statistics(model=model,
-                              dataset_loader=test_loader,
-                              predictors=predictors)
-
-        print([(k, np.mean(v), np.std(v))
-               for k, v in correct_stats.items()])
-        print([(k, np.mean(v), np.std(v))
-               for k, v in incorrect_stats.items()])
-
-        for epsilon in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
-                        0.7, 0.8, 0.9, 0.95, 0.98]:
-            # for epsilon in [0.9]:
-            prior_gt, b = binary_eval(model=model,
-                                      dataset_loader=test_loader,
-                                      predictors=predictors,
-                                      epsilon=[0.7 if epsilon <= 0.7
-                                               else epsilon]
-                                              + ([epsilon] * (
-                                                  model.n_branches() - 1)),
-                                      cumulative_threshold=False)
-
-            prior_gt, b = dict(prior_gt), dict(b)
-
-            s = '\tEpsilon {}. '.format(epsilon)
-            for k in sorted([k for k in prior_gt.keys() if k != 'global']):
-                s += 'B: {}, S: {}, C: {}. '.format(k,
-                                                    np.round(prior_gt[k]
-                                                             * 100,
-                                                             2),
-                                                    b[k])
-            s += 'GS: {}'.format(prior_gt['global'])
-
-            print(s)
-
-        mean_kl_loss = np.mean(kl_losses)
-        mean_losses.append(mean_loss)
-        bar.set_postfix(
-            {
-                'Train score': train_scores, 'Test score': test_scores,
-                'Eval score': eval_scores if eval_scores != 0 else 0,
-                'Mean loss': mean_loss
-            })
-
-    return (best_model, best_predictors), \
-           scores, scores[best_model_i], mean_losses
-
-
 def binary_bernulli_trainer(model: BranchModel,
                             predictors: nn.ModuleList,
                             optimizer,
@@ -534,6 +296,7 @@ def binary_bernulli_trainer(model: BranchModel,
                             regularization_scaling=False,
                             dropout=0,
                             backbone_epochs=0):
+
     def classification_loss(logits, ground_truth, confidence_scores,
                             drop=False):
         if normalize_weights:
@@ -786,135 +549,11 @@ def binary_bernulli_trainer(model: BranchModel,
 
                 if fix_last_layer:
                     distributions[:, -1] = 1
-            #
-            # if recursive:
-            #     assert False
-            #
-            #     _pred = []
-            #
-            #     y_output = preds[:, -1]
-            #
-            #     for i in range(preds.shape[1] - 1, -1, -1):
-            #         y_b = preds[:, i]
-            #         y_c = distributions[:, i]
-            #
-            #         y_output = y_b * y_c + (1 - y_c) * y_output
-            #
-            #     loss = nn.functional.cross_entropy(y_output, y,
-            #                                        reduction='mean')
-            #
-            # else:
-            #
-            #     # drop = torch.full(distributions.shape[:2], 0.5,
-            #     #                   device=device)
-            #     #
-            #     # mask = torch.bernoulli(drop).unsqueeze(-1)
-            #     # distributions = mask * distributions
-            #     #
-            #     # if fix_last_layer:
-            #     #     distributions[:, -1] = 1
-            #     #
-            #
-            #     if dropout > 0:
-            #         with torch.no_grad():
-            #             assert dropout < 1
-            #             # a = torch.quantile(distributions, 0.5, 1)
-            #             # distributions[distributions > a] = 0
-            #
-            #             # drop = torch.full(distributions.shape[:2], dropout,
-            #             #                   device=device) .unsqueeze(-1)
-            #             # mask = torch.bernoulli(drop).unsqueeze(-1)
-            #
-            #             mask = torch.bernoulli(1 - distributions)
-            #
-            #             if fix_last_layer:
-            #                 mask[:, -1] = 1
-            #
-            #             distributions = mask * distributions
-            #
-            #     if normalize_weights:
-            #         a, b = torch.split(distributions,
-            #                            [distributions.shape[1] - 1, 1],
-            #                            dim=1)
-            #
-            #         c = torch.cumprod(1 - a, 1)
-            #
-            #         cat = torch.cat((torch.ones_like(b), c), 1)
-            #         distributions = distributions * cat
-            #
-            #     if joint_type == 'logits':
-            #         # preds = preds * distributions
-            #         #
-            #         # f_hat = torch.sum(preds, 1)
-            #         # # f_hat /= distributions.sum(1)
-            #         #
-            #         # loss = nn.functional.cross_entropy(f_hat, y,
-            #         #                                    reduction='mean')
-            #         if normalize_weights:
-            #             p1, p2 = torch.split(preds,
-            #                                  [preds.shape[1] - 1, 1],
-            #                                  dim=1)
-            #
-            #             d1, _ = torch.split(distributions,
-            #                                 [preds.shape[1] - 1, 1],
-            #                                 dim=1)
-            #
-            #             p1 = p1 * d1
-            #
-            #             # if dropout > 0:
-            #             #     f_hat = p1.sum(1) + p2.squeeze()
-            #             #     loss = nn.functional.cross_entropy(f_hat, y,
-            #             #                                        reduction='mean')
-            #             # else:
-            #             f_hat = p1.sum(1)
-            #             p2 = p2.squeeze()
-            #
-            #             loss = nn.functional.cross_entropy(f_hat, y,
-            #                                                reduction='mean')
-            #             loss += nn.functional.cross_entropy(p2, y,
-            #                                                 reduction='mean')
-            #
-            #         else:
-            #             # preds = torch.cumsum(preds, 1)
-            #             #
-            #             # loss = torch.stack(
-            #             #     [nn.functional.cross_entropy(preds[:, p], y,
-            #             #                                  reduction='none')
-            #             #      for p in range(preds.shape[1])], -1)
-            #             #
-            #             # loss = loss.mean(0)
-            #             # loss = loss.sum()
-            #
-            #             preds = preds * distributions
-            #
-            #             f_hat = torch.sum(preds, 1)
-            #             # f_hat /= distributions.sum(1)
-            #
-            #             loss = nn.functional.cross_entropy(f_hat, y,
-            #                                                reduction='mean')
-            #
-            #     else:
-            #
-            #         loss = torch.stack(
-            #             [nn.functional.cross_entropy(preds[:, p], y,
-            #                                          reduction='none')
-            #              for p in range(preds.shape[1])], -1)
-            #
-            #         distributions = 1 - distributions.squeeze()
-            #         loss = loss * distributions
-            #
-            #         loss = loss.mean(0)
-            #         loss = loss.sum()
 
             if dropout > 0:
                 with torch.no_grad():
                     assert dropout < 1
 
-                    # if epoch < epochs // 2:
-                    #     drop = torch.full_like(distributions.shape[:2] + (1, ),
-                    #                            dropout)
-                    #     mask = torch.bernoulli(drop).unsqueeze(-1)
-                    # else:
                     mask = torch.bernoulli(1 - distributions)
 
                     if fix_last_layer:
@@ -925,13 +564,6 @@ def binary_bernulli_trainer(model: BranchModel,
             loss = classification_loss(preds, y, distributions, drop=True)
 
             losses.append(loss.item())
-
-            # loss = (1 - 0.3) * loss + 0.3 * kl
-            # loss = (1 - kl_w[bi]) * loss + kl_w[bi] * kl
-            # loss = (1 - beta) * loss + beta * kl
-            # loss = (1 - kl_w[epoch]) * loss + kl_w[epoch] * kl
-
-            # loss = loss + kl_w[bi] * kl
 
             loss = loss + (reg_term * current_prior_w)
 
@@ -951,43 +583,6 @@ def binary_bernulli_trainer(model: BranchModel,
             """eval_scores = standard_eval(model, eval_loader, topk=[1, 5],
                                         device=device)"""
             branches_scores = branches_eval(model, predictors, eval_loader)
-            # print(branches_scores)
-
-            # eval_loss = 0
-            # tot = 0
-            #
-            # model.eval()
-            # predictors.eval()
-            #
-            # with torch.no_grad():
-            #     for x, y in eval_loader:
-            #         tot += x.shape[0]
-            #
-            #         x, y = x.to(device), y.to(device)
-            #
-            #         bos = model(x)
-            #
-            #         distributions, logits = [], []
-            #
-            #         for j, bo in enumerate(bos):
-            #             l, b = predictors[j](bo)
-            #             distributions.append(b)
-            #             logits.append(l)
-            #
-            #         preds = torch.stack(logits, 1)
-            #         distributions = torch.stack(distributions, 1)
-            #
-            #         loss = classification_loss(preds, y, distributions)
-            #
-            #         eval_loss += loss.sum().item()
-            #
-            # eval_loss = eval_loss / tot
-            # # print(eval_loss)
-            # eval_scores = eval_loss
-
-            # if current_prior_w > 0:
-            #     eval_scores = np.mean([v for k, v in branches_scores.items()])
-            # else:
             eval_scores = branches_scores['final']
 
         else:

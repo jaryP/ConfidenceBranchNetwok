@@ -1,16 +1,213 @@
+import csv
+import os
+
 import numpy as np
+from PIL.Image import Image
+from torch.utils.data import Dataset
 
 from models.alexnet import AlexnetClassifier, AlexNet
 from models.base import IntermediateBranch, BinaryIntermediateBranch
+from torchvision.datasets.folder import default_loader
 
 import torch
 from torch import optim, nn
 from torchvision import datasets
 from torchvision.transforms import Resize, ToTensor, Normalize, Compose, \
-    RandomHorizontalFlip, RandomCrop
+    RandomHorizontalFlip, RandomCrop, RandomRotation
 
 from models.resnet import resnet20
 from models.vgg import vgg11
+
+
+class TinyImagenet(Dataset):
+    """Tiny Imagenet Pytorch Dataset"""
+
+    filename = ('tiny-imagenet-200.zip',
+                'http://cs231n.stanford.edu/tiny-imagenet-200.zip')
+
+    md5 = '90528d7ca1a48142e341f4ef8d21d0de'
+
+    def __init__(
+            self,
+            root,
+            *,
+            train: bool = True,
+            transform=None,
+            target_transform=None,
+            loader=default_loader,
+            download=True):
+        """
+        Creates an instance of the Tiny Imagenet dataset.
+        :param root: folder in which to download dataset. Defaults to None,
+            which means that the default location for 'tinyimagenet' will be
+            used.
+        :param train: True for training set, False for test set.
+        :param transform: Pytorch transformation function for x.
+        :param target_transform: Pytorch transformation function for y.
+        :param loader: the procedure to load the instance from the storage.
+        :param bool download: If True, the dataset will be  downloaded if
+            needed.
+        """
+
+        self.transform = transform
+        self.target_transform = target_transform
+        self.train = train
+        self.loader = loader
+
+        # super(TinyImagenet, self).__init__(
+        #     root, self.filename[1], self.md5, download=download, verbose=True)
+
+        self.root = root
+
+        # self._load_dataset()
+        self._load_metadata()
+
+    # def _load_dataset(self) -> None:
+    #     """
+    #     The standardized dataset download and load procedure.
+    #     For more details on the coded procedure see the class documentation.
+    #     This method shouldn't be overridden.
+    #     This method will raise and error if the dataset couldn't be loaded
+    #     or downloaded.
+    #     :return: None
+    #     """
+    #     metadata_loaded = False
+    #     metadata_load_error = None
+    #
+    #     try:
+    #         metadata_loaded = self._load_metadata()
+    #     except Exception as e:
+    #         metadata_load_error = e
+    #
+    #     if metadata_loaded:
+    #         if self.verbose:
+    #             print('Files already downloaded and verified')
+    #         return
+    #
+    #     if not self.download:
+    #         msg = 'Error loading dataset metadata (dataset download was ' \
+    #               'not attempted as "download" is set to False)'
+    #         if metadata_load_error is None:
+    #             raise RuntimeError(msg)
+    #         else:
+    #             print(msg)
+    #             raise metadata_load_error
+
+    def _load_metadata(self) -> bool:
+        self.data_folder = self.root / 'tiny-imagenet-200'
+
+        self.label2id, self.id2label = TinyImagenet.labels2dict(
+            self.data_folder)
+        self.data, self.targets = self.load_data()
+        return True
+
+    @staticmethod
+    def labels2dict(data_folder):
+        """
+        Returns dictionaries to convert class names into progressive ids
+        and viceversa.
+        :param data_folder: The root path of tiny imagenet
+        :returns: label2id, id2label: two Python dictionaries.
+        """
+
+        label2id = {}
+        id2label = {}
+
+        with open(str(data_folder / 'wnids.txt'), 'r') as f:
+
+            reader = csv.reader(f)
+            curr_idx = 0
+            for ll in reader:
+                if ll[0] not in label2id:
+                    label2id[ll[0]] = curr_idx
+                    id2label[curr_idx] = ll[0]
+                    curr_idx += 1
+
+        return label2id, id2label
+
+    def load_data(self):
+        """
+        Load all images paths and targets.
+        :return: train_set, test_set: (train_X_paths, train_y).
+        """
+
+        data = [[], []]
+
+        classes = list(range(200))
+        for class_id in classes:
+            class_name = self.id2label[class_id]
+
+            if self.train:
+                X = self.get_train_images_paths(class_name)
+                Y = [class_id] * len(X)
+            else:
+                # test set
+                X = self.get_test_images_paths(class_name)
+                Y = [class_id] * len(X)
+
+            data[0] += X
+            data[1] += Y
+
+        return data
+
+    def get_train_images_paths(self, class_name):
+        """
+        Gets the training set image paths.
+        :param class_name: names of the classes of the images to be
+            collected.
+        :returns img_paths: list of strings (paths)
+        """
+        train_img_folder = self.data_folder / 'train' / class_name / 'images'
+
+        img_paths = [f for f in train_img_folder.iterdir() if f.is_file()]
+
+        return img_paths
+
+    def get_test_images_paths(self, class_name):
+        """
+        Gets the test set image paths
+        :param class_name: names of the classes of the images to be
+            collected.
+        :returns img_paths: list of strings (paths)
+        """
+
+        val_img_folder = self.data_folder / 'val' / 'images'
+        annotations_file = self.data_folder / 'val' / 'val_annotations.txt'
+
+        valid_names = []
+
+        # filter validation images by class using appropriate file
+        with open(str(annotations_file), 'r') as f:
+
+            reader = csv.reader(f, dialect='excel-tab')
+            for ll in reader:
+                if ll[1] == class_name:
+                    valid_names.append(ll[0])
+
+        img_paths = [val_img_folder / f for f in valid_names]
+
+        return img_paths
+
+    def __len__(self):
+        """ Returns the length of the set """
+        return len(self.data)
+
+    def __getitem__(self, index):
+        """ Returns the index-th x, y pattern of the set """
+
+        path, target = self.data[index], int(self.targets[index])
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = self.loader(path)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
 
 
 def get_device(model: nn.Module):
@@ -80,7 +277,6 @@ def get_intermediate_classifiers(model,
                                                     nn.Linear(od,
                                                               num_classes + 1)])
 
-
                     b = BinaryIntermediateBranch(preprocessing=nn.Flatten(),
                                                  classifier=linear_layers,
                                                  )
@@ -147,7 +343,7 @@ def get_model(name, image_size, classes, get_binaries=False,
             assert False
     elif 'resnet' in name:
         if name == 'resnet20':
-            model = resnet20(None)
+            model = resnet20()
         else:
             assert False
     else:
@@ -309,47 +505,57 @@ def get_dataset(name, model_name, augmentation=False):
 
         input_size, classes = (3, 32, 32), 100
 
-    # elif name == 'tinyimagenet':
-    #     tt = [
-    #         ToTensor(),
-    #         # transforms.RandomCrop(56),
-    #         RandomResizedCrop(64),
-    #         RandomHorizontalFlip(),
-    #         Normalize((0.4802, 0.4481, 0.3975),
-    #                              (0.2302, 0.2265, 0.2262))
-    #     ]
-    #
-    #     t = [
-    #         ToTensor(),
-    #         Normalize((0.4802, 0.4481, 0.3975),
-    #                              (0.2302, 0.2265, 0.2262))
-    #     ]
-    #
-    #     transform = Compose(t)
-    #     train_transform = Compose(tt)
-    #
-    #     # train_set = TinyImageNet(
-    #     #     root='~/loss_landscape_dataset/tiny-imagenet-200', split='train',
-    #     #     transform=transform)
-    #
-    #     train_set = datasets.ImageFolder('~/loss_landscape_dataset/tiny-imagenet-200/train',
-    #                                      transform=train_transform)
-    #
-    #     # for x, y in train_set:
-    #     #     if x.shape[exp_0] == 1:
-    #     #         print(x.shape[exp_0] == 1)
-    #
-    #     # test_set = TinyImageNet(
-    #     #     root='~/loss_landscape_dataset/tiny-imagenet-200', split='val',
-    #     #     transform=train_transform)
-    #     test_set = datasets.ImageFolder('~/loss_landscape_dataset/tiny-imagenet-200/val',
-    #                                     transform=transform)
-    #
-    #     # for x, y in test_set:
-    #     #     if x.shape[exp_0] == 1:
-    #     #         print(x.shape[exp_0] == 1)
-    #
-    #     input_size, classes = 3, 200
+    elif name == 'tinyimagenet':
+        if augmentation:
+            tt = [
+                RandomRotation(20),
+                RandomHorizontalFlip(0.5),
+                ToTensor(),
+                Normalize((0.4802, 0.4481, 0.3975),
+                          (0.2302, 0.2265, 0.2262)),
+            ]
+        else:
+            tt = [
+                Normalize((0.4802, 0.4481, 0.3975),
+                          (0.2302, 0.2265, 0.2262)),
+                ToTensor()]
+
+        t = [
+            ToTensor(),
+            Normalize((0.4802, 0.4481, 0.3975),
+                      (0.2302, 0.2265, 0.2262))
+        ]
+
+        transform = Compose(t)
+        train_transform = Compose(tt)
+
+        # train_set = TinyImageNet(
+        #     root='./datasets/tiny-imagenet-200', split='train',
+        #     transform=transform)
+        train_set = TinyImagenet('~/datasets/tiny-imagenet-200/train',
+                                 transform=train_transform)
+
+        test_set = TinyImagenet('~/datasets/tiny-imagenet-200/eval',
+                                transform=transform)
+
+        # train_set = datasets.ImageFolder('~/datasets/tiny-imagenet-200/train',
+        #                                  transform=train_transform)
+        #
+        # # for x, y in train_set:
+        # #     if x.shape[0] == 1:
+        # #         print(x.shape[0] == 1)
+        #
+        # # test_set = TinyImageNet(
+        # #     root='./datasets/tiny-imagenet-200', split='val',
+        # #     transform=train_transform)
+        # test_set = datasets.ImageFolder('~/datasets/tiny-imagenet-200/test',
+        #                                 transform=transform)
+
+        # for x, y in test_set:
+        #     if x.shape[0] == 1:
+        #         print(x.shape[0] == 1)
+
+        input_size, classes = (3, 64, 64), 200
 
     else:
         assert False
