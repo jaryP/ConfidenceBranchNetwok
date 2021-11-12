@@ -87,28 +87,6 @@ def branches_eval(model: BranchModel, predictors, dataset_loader):
     scores = {k: v / tot for k, v in corrects.items()}
     scores['final'] = scores.pop(len(predictors) - 1)
 
-    # for i in range(len(predictors)):
-    #     predictor = predictors[i]
-    #
-    #     total = 0
-    #     correct = 0
-    #
-    #     for x, y in dataset_loader:
-    #         x, y = x.to(device), y.to(device)
-    #
-    #         pred = model(x)[i]
-    #
-    #         pred = predictor.logits(pred)
-    #         pred = torch.argmax(pred, 1)
-    #
-    #         total += y.size(0)
-    #         correct += (pred == y).sum().item()
-    #
-    #     if i == (len(predictors) - 1):
-    #         i = 'final'
-    #
-    #     scores[i] = correct / total
-
     return scores
 
 
@@ -202,7 +180,6 @@ def binary_eval(model: BranchModel,
                 sample=False):
     model.eval()
     predictors.eval()
-    # binary_classifiers.eval()
     device = get_device(model)
 
     if epsilon is None:
@@ -228,20 +205,15 @@ def binary_eval(model: BranchModel,
 
         distributions = torch.stack(distributions, 0)
 
-        # if sample:
-        #     distributions = ContinuousBernoulli(distributions).rsample()
-
         if cumulative_threshold:
             distributions[1:] = distributions[1:] * \
-                            torch.cumprod(1 - distributions[:-1], 0)
+                                torch.cumprod(1 - distributions[:-1], 0)
             distributions = torch.cumsum(distributions, dim=0)
 
         logits = torch.stack(logits, 0)
 
         for bi in range(x.shape[0]):
             found = False
-
-            # b = 0
             for i in range(logits.shape[0]):
 
                 b = distributions[i][bi]
@@ -294,7 +266,6 @@ def binary_eval(model: BranchModel,
 def binary_statistics(model: BranchModel,
                       predictors: nn.ModuleList,
                       dataset_loader):
-
     model.eval()
     predictors.eval()
     device = get_device(model)
@@ -321,18 +292,56 @@ def binary_statistics(model: BranchModel,
                 else:
                     incorrect[i].append(h)
 
-    # correct_results = {}
-    # incorrect_results = {}
+    return dict(correct), dict(incorrect)
 
-    # for i in range(len(predictors)):
-    #     mn = np.mean(correct[i])
-    #     std = np.std(correct[i])
-    #
-    #     correct_results[i] = {'mean': mn, 'std': std}
-    #
-    #     mn = np.mean(incorrect[i])
-    #     std = np.std(incorrect[i])
-    #
-    #     incorrect_results[i] = {'mean': mn, 'std': std}
+
+@torch.no_grad()
+def binary_statistics_cumulative(model: BranchModel,
+                                 predictors: nn.ModuleList,
+                                 dataset_loader,
+                                 th=-1):
+    model.eval()
+    predictors.eval()
+    device = get_device(model)
+
+    correct = defaultdict(list)
+    incorrect = defaultdict(list)
+
+    for x, y in dataset_loader:
+        x, y = x.to(device), y.to(device)
+
+        bos = model(x)
+
+        distributions, logits = [], []
+
+        for j, bo in enumerate(bos):
+            l, b = predictors[j](bo)
+            distributions.append(b)
+            logits.append(l)
+
+        preds = torch.stack(logits, 1)
+        distributions = torch.stack(distributions, 1)
+
+        a, b = torch.split(distributions,
+                           [distributions.shape[1] - 1, 1],
+                           dim=1)
+
+        c = torch.cumprod(1 - a, 1)
+
+        cat = torch.cat((torch.ones_like(b), c), 1)
+        distributions = distributions * cat
+        distributions = torch.cumsum(distributions, 1)
+
+        pred = torch.argmax(preds, -1)
+
+        for pr, hs, y in zip(pred, distributions, y):
+            for i, (p, h) in enumerate(zip(pr, hs)):
+                if h >= th:
+                    h = h.item()
+                    if y == p:
+                        correct[i].append(h)
+                        break
+                    else:
+                        incorrect[i].append(h)
 
     return dict(correct), dict(incorrect)

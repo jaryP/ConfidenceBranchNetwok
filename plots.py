@@ -137,7 +137,6 @@ def plot_heatmap(results: dict, branches=5):
 
 
 def plot_lines(results: dict, costs: dict, branches_scores: dict, branches=5):
-
     keys = sorted(map(float, results.keys()))
     # colors = ['b', 'g', 'r', 'c', 'm', 'k']
     # legend = set()
@@ -181,7 +180,7 @@ def plot_lines(results: dict, costs: dict, branches_scores: dict, branches=5):
         lw = mpl.rcParams['lines.linewidth'] if not last else \
             mpl.rcParams['lines.linewidth'] * 1.5
 
-        label = 'Branch {}'.format(i + 1) if not last  \
+        label = 'Branch {}'.format(i + 1) if not last \
             else 'Global Accuracy'
 
         poly = np.polyfit(range(len(p)), p, 2)
@@ -283,15 +282,22 @@ def plot_statistics(results: dict, branches=5):
     keys = sorted(correct.keys())
 
     for key in keys:
-        fig, (ax1, ax2) = plt.subplots(2, sharex=True)
+        # fig, (ax1, ax2) = plt.subplots(2, sharex=True)
+        fig, ax1 = plt.subplots(1, sharex=True)
         # ax1.set_ylim(-0.1, 1.05)
         # ax2.set_ylim(-0.1, 1.05)
 
         cor = np.asarray(correct[key])[:, None]
         inc = np.asarray(incorrect[key])[:, None]
 
-        bottom, _, _ = ax1.hist(cor, bins=50, density=False, color='r')
-        ax2.hist(inc, bins=50, bottom=None, density=False, color='b')
+        bottom, _, _ = ax1.hist(cor, bins=50, density=False, color='r',
+                                alpha=.8, fill=False, histtype='step')
+        ax1.hist(inc, bins=50, bottom=bottom, alpha=.8,
+                 density=False, color='b', histtype='step')
+
+        #ax2.hist(inc, bins=50, bottom=None, density=False, color='b', alpha=.5)
+
+        ax1.set_xlabel('Confidence')
 
         fis.append(fig)
         # plt.show()
@@ -368,7 +374,21 @@ def my_app() -> None:
                                                'stats{}.pdf'.format(i)),
                                   bbox_inches=None)
 
-                    plt.close('all')
+                        plt.close('all')
+
+                if 'binary_statistics_threshold' in results:
+                    r = results['binary_statistics_threshold']
+                    for th in r:
+                        figs = plot_statistics(r[th],
+                                               branches=branches)
+
+                        for i, f in enumerate(figs):
+                            f.savefig(os.path.join(plot_dirs,
+                                                   'stats{}_th{}.pdf'.
+                                                   format(i, th)),
+                                      bbox_inches=None)
+
+                        plt.close('all')
 
                 if 'binary_results' in results:
                     # binary_scores_fig = plot_scores(results['binary_results'],
@@ -378,9 +398,9 @@ def my_app() -> None:
                     #     bbox_inches=None)
 
                     f1, f2, f3 = plot_lines(results['binary_results'],
-                                        results['costs'],
-                                        results['branch_scores'],
-                                        branches=branches)
+                                            results['costs'],
+                                            results['branch_scores'],
+                                            branches=branches)
 
                     f1.savefig(os.path.join(plot_dirs,
                                             'binary_scores.pdf'),
@@ -413,9 +433,9 @@ def my_app() -> None:
                     #     bbox_inches=None)
 
                     f1, f2, f3 = plot_lines(results['cumulative_results'],
-                                        results['costs'],
-                                        results['branch_scores'],
-                                        branches=branches)
+                                            results['costs'],
+                                            results['branch_scores'],
+                                            branches=branches)
 
                     f1.savefig(os.path.join(plot_dirs,
                                             'cumulative_scores.pdf'),
@@ -440,16 +460,11 @@ def my_app() -> None:
                     plt.close('all')
 
                 if 'entropy_results' in results:
-                    # cumulative_scores_fig = plot_scores(
-                    #     results['entropy_results'],
-                    #     branches=branches)
-                    # cumulative_scores_fig.savefig(os.path.join(
-                    #     plot_dirs, 'entropy_results.pdf'), bbox_inches=None)
 
                     f1, f2, f3 = plot_lines(results['entropy_results'],
-                                        results['costs'],
-                                        results['branch_scores'],
-                                        branches=branches)
+                                            results['costs'],
+                                            results['branch_scores'],
+                                            branches=branches)
 
                     f1.savefig(os.path.join(plot_dirs,
                                             'entropy_scores.pdf'),

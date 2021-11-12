@@ -2,14 +2,17 @@ import json
 import logging
 import os
 import warnings
+from copy import deepcopy
 from itertools import chain
 
 import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from torchvision.datasets import ImageFolder
+
 from base.evaluators import binary_eval, entropy_eval, standard_eval, \
-    branches_eval, binary_statistics
+    branches_eval, binary_statistics, binary_statistics_cumulative
 from base.trainer import binary_bernulli_trainer, joint_trainer, \
     standard_trainer, adaptive_trainer
 from utils import get_dataset, get_optimizer, get_model, EarlyStopping
@@ -113,6 +116,11 @@ def my_app(cfg: DictConfig) -> None:
             train_set, eval = torch.utils.data.random_split(train_set,
                                                             [train_len,
                                                              eval_len])
+
+            if isinstance(test_set, ImageFolder):
+                eval = deepcopy(eval.dataset)
+                train_set = deepcopy(train_set.dataset)
+            
             eval.transform = test_set.transform
             eval.target_transform = test_set.target_transform
 
@@ -474,13 +482,32 @@ def my_app(cfg: DictConfig) -> None:
 
         if 'bernulli' in method_name:
 
-            correct_stats, incorrect_stats = \
-                binary_statistics(model=backbone,
-                                  dataset_loader=testloader,
-                                  predictors=classifiers)
+            correct_stats, incorrect_stats = binary_statistics_cumulative(
+                model=backbone,
+                dataset_loader=testloader,
+                predictors=classifiers)
+
+            # correct_stats, incorrect_stats = \
+            #     binary_statistics(model=backbone,
+            #                       dataset_loader=testloader,
+            #                       predictors=classifiers)
 
             results['binary_statistics'] = {'correct': correct_stats,
                                             'incorrect': incorrect_stats}
+
+            cumulative_threshold_stats = {}
+
+            for epsilon in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]:
+                correct_stats, incorrect_stats = binary_statistics_cumulative(
+                    model=backbone,
+                    dataset_loader=testloader,
+                    predictors=classifiers, th=epsilon)
+
+                cumulative_threshold_stats[epsilon] = \
+                    {'correct': correct_stats,
+                     'incorrect': incorrect_stats}
+
+            results['binary_statistics_threshold'] = cumulative_threshold_stats
 
             cumulative_threshold_scores = {}
 
